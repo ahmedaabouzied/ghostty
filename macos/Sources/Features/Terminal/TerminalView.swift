@@ -1,5 +1,5 @@
-import SwiftUI
 import GhosttyKit
+import SwiftUI
 import os
 
 /// This delegate is notified of actions and property changes regarding the terminal view. This
@@ -75,49 +75,53 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                 VStack(spacing: 0) {
                     // If we're running in debug mode we show a warning so that users
                     // know that performance will be degraded.
-                    if Ghostty.info.mode == GHOSTTY_BUILD_MODE_DEBUG || Ghostty.info.mode == GHOSTTY_BUILD_MODE_RELEASE_SAFE {
+                    if Ghostty.info.mode == GHOSTTY_BUILD_MODE_DEBUG
+                        || Ghostty.info.mode == GHOSTTY_BUILD_MODE_RELEASE_SAFE
+                    {
                         DebugBuildWarningView()
                     }
 
                     TerminalSplitTreeView(
                         tree: viewModel.surfaceTree,
-                        action: { delegate?.performSplitAction($0) })
-                        .environmentObject(ghostty)
-                        .ghosttyLastFocusedSurface(lastFocusedSurface)
-                        .focused($focused)
-                        .onAppear { self.focused = true }
-                        .onChange(of: focusedSurface) { newValue in
-                            // We want to keep track of our last focused surface so even if
-                            // we lose focus we keep this set to the last non-nil value.
-                            if newValue != nil {
-                                lastFocusedSurface = .init(newValue)
-                                self.delegate?.focusedSurfaceDidChange(to: newValue)
-                            }
+                        action: { delegate?.performSplitAction($0) }
+                    )
+                    .environmentObject(ghostty)
+                    .ghosttyLastFocusedSurface(lastFocusedSurface)
+                    .focused($focused)
+                    .onAppear { self.focused = true }
+                    .onChange(of: focusedSurface) { newValue in
+                        // We want to keep track of our last focused surface so even if
+                        // we lose focus we keep this set to the last non-nil value.
+                        if newValue != nil {
+                            lastFocusedSurface = .init(newValue)
+                            self.delegate?.focusedSurfaceDidChange(to: newValue)
                         }
-                        .onChange(of: pwdURL) { newValue in
-                            self.delegate?.pwdDidChange(to: newValue)
-                        }
-                        .onChange(of: cellSize) { newValue in
-                            guard let size = newValue else { return }
-                            self.delegate?.cellSizeDidChange(to: size)
-                        }
-                        .frame(idealWidth: lastFocusedSurface?.value?.initialSize?.width,
-                               idealHeight: lastFocusedSurface?.value?.initialSize?.height)
-                        if ghostty.config.macosStatusBar {
-                            Text("status bar goes here")
-                            .frame(maxWidth: .infinity)
-                            .background(Color(.windowBackgroundColor))
-                        }
+                    }
+                    .onChange(of: pwdURL) { newValue in
+                        self.delegate?.pwdDidChange(to: newValue)
+                    }
+                    .onChange(of: cellSize) { newValue in
+                        guard let size = newValue else { return }
+                        self.delegate?.cellSizeDidChange(to: size)
+                    }
+                    .frame(
+                        idealWidth: lastFocusedSurface?.value?.initialSize?.width,
+                        idealHeight: lastFocusedSurface?.value?.initialSize?.height)
+                    if ghostty.config.macosStatusBar {
+                        StatusBarView()
+                    }
                 }
                 // Ignore safe area to extend up in to the titlebar region if we have the "hidden" titlebar style
-                .ignoresSafeArea(.container, edges: ghostty.config.macosTitlebarStyle == .hidden ? .top : [])
+                .ignoresSafeArea(
+                    .container, edges: ghostty.config.macosTitlebarStyle == .hidden ? .top : [])
 
                 if let surfaceView = lastFocusedSurface?.value {
                     TerminalCommandPaletteView(
                         surfaceView: surfaceView,
                         isPresented: $viewModel.commandPaletteIsShowing,
                         ghosttyConfig: ghostty.config,
-                        updateViewModel: (NSApp.delegate as? AppDelegate)?.updateViewModel) { action in
+                        updateViewModel: (NSApp.delegate as? AppDelegate)?.updateViewModel
+                    ) { action in
                         self.delegate?.performAction(action, on: surfaceView)
                     }
                 }
@@ -162,11 +166,13 @@ struct DebugBuildWarningView: View {
             Text("You're running a debug build of Ghostty! Performance will be degraded.")
                 .padding(.all, 8)
                 .popover(isPresented: $isPopover, arrowEdge: .bottom) {
-                    Text("""
-                    Debug builds of Ghostty are very slow and you may experience
-                    performance problems. Debug builds are only recommended during
-                    development.
-                    """)
+                    Text(
+                        """
+                        Debug builds of Ghostty are very slow and you may experience
+                        performance problems. Debug builds are only recommended during
+                        development.
+                        """
+                    )
                     .padding(.all)
                 }
 
@@ -176,7 +182,9 @@ struct DebugBuildWarningView: View {
         .frame(maxWidth: .infinity)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Debug build warning")
-        .accessibilityValue("Debug builds of Ghostty are very slow and you may experience performance problems. Debug builds are only recommended during development.")
+        .accessibilityValue(
+            "Debug builds of Ghostty are very slow and you may experience performance problems. Debug builds are only recommended during development."
+        )
         .accessibilityAddTraits(.isStaticText)
         .onTapGesture {
             isPopover = true

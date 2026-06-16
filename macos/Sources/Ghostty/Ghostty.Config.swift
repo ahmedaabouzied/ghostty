@@ -274,6 +274,14 @@ extension Ghostty {
             return v
         }
 
+        var macosStatusBar: Bool {
+            guard let config = self.config else { return false }
+            var v = false
+            let key = "macos-status-bar"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
         /// Returns the fullscreen mode if fullscreen is enabled, or nil if disabled.
         /// This parses the `fullscreen` enum config which supports both
         /// native and non-native fullscreen modes.

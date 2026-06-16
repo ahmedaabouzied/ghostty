@@ -3311,6 +3311,14 @@ keybind: Keybinds = .{},
 /// Available since: 1.2.0
 @"macos-window-buttons": MacWindowButtons = .visible,
 
+/// Show a status bar at the bottom of each macOS window displaying live
+/// system stats (CPU, memory, battery, clock).
+///
+/// The default value is `false`.
+///
+/// Available since: 1.3.0
+@"macos-status-bar": bool = false,
+
 /// The style of the macOS titlebar. Available values are: "native",
 /// "transparent", "tabs", and "hidden".
 ///

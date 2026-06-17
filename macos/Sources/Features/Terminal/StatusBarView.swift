@@ -5,21 +5,38 @@ import IOKit.ps
 final class StatusBarModel: ObservableObject {
     @Published var clock: String = ""
     @Published var load: String = ""
-    @Published var cpuPercent: Double = 0       // 0...100
+    @Published var perCore: [Double] = []       // 0...100 per CPU core
     @Published var memoryPercent: Double = 0    // 0...100
+    @Published var diskPercent: Double = 0      // 0...100 (used)
+    @Published var network: String = ""         // "↓ x ↑ y"
+    @Published var uptime: String = ""
     @Published var battery: String?             // nil when there's no battery (desktops) -> hidden
     @Published var thermalState: ProcessInfo.ThermalState = .nominal
 
     private var timer: Timer?
 
-    // CPU ticks are cumulative since boot, so we keep the previous sample and
-    // report the delta each tick. nil until the first sample is taken.
-    private var previousCPUTicks: host_cpu_load_info_data_t?
+    // Cumulative-since-boot counters: keep the previous sample to report a delta.
+    private var previousCoreTicks: [[UInt32]]?
+    private var previousNet: (inBytes: UInt64, outBytes: UInt64)?
+    private var previousNetTime: Date?
 
     // Built once; formatters are expensive to create and tick() runs every second.
     private let timeFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss"
+        return f
+    }()
+    private let byteRateFormatter: ByteCountFormatter = {
+        let f = ByteCountFormatter()
+        f.countStyle = .file            // decimal (1000) — network convention
+        f.allowedUnits = [.useKB, .useMB, .useGB]
+        return f
+    }()
+    private let uptimeFormatter: DateComponentsFormatter = {
+        let f = DateComponentsFormatter()
+        f.allowedUnits = [.day, .hour, .minute]
+        f.unitsStyle = .abbreviated
+        f.maximumUnitCount = 2
         return f
     }()
 
@@ -40,8 +57,11 @@ final class StatusBarModel: ObservableObject {
     private func tick() {
         clock = timeFormatter.string(from: Date())
         load = loadAverageString()
-        cpuPercent = cpuUsagePercent()
+        perCore = perCoreUsage()
         memoryPercent = memoryUsedPercent()
+        diskPercent = diskUsedPercent()
+        network = networkRateString()
+        uptime = uptimeFormatter.string(from: ProcessInfo.processInfo.systemUptime) ?? "—"
         battery = batteryString()
         thermalState = ProcessInfo.processInfo.thermalState
     }
@@ -55,33 +75,46 @@ final class StatusBarModel: ObservableObject {
         return String(format: "%.2f", loads[0])
     }
 
-    /// Whole-machine CPU usage as a percentage. CPU ticks are cumulative since
-    /// boot, so usage = busy delta / total delta between this tick and the last.
-    private func cpuUsagePercent() -> Double {
-        let host = mach_host_self()
-        var info = host_cpu_load_info_data_t()
-        var count = mach_msg_type_number_t(
-            MemoryLayout<host_cpu_load_info_data_t>.stride / MemoryLayout<integer_t>.stride)
-        let kr = withUnsafeMutablePointer(to: &info) { ptr in
-            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { reboundPtr in
-                host_statistics(host, host_flavor_t(HOST_CPU_LOAD_INFO), reboundPtr, &count)
-            }
+    /// Per-core CPU usage %. Ticks are cumulative since boot, so we diff against
+    /// the previous sample. The kernel hands us a heap buffer we must free.
+    private func perCoreUsage() -> [Double] {
+        var cpuInfo: processor_info_array_t?
+        var infoCount: mach_msg_type_number_t = 0
+        var cpuCount: natural_t = 0
+        let kr = host_processor_info(
+            mach_host_self(), PROCESSOR_CPU_LOAD_INFO, &cpuCount, &cpuInfo, &infoCount)
+        guard kr == KERN_SUCCESS, let info = cpuInfo else { return perCore }
+        defer {
+            vm_deallocate(
+                mach_task_self_,
+                vm_address_t(UInt(bitPattern: info)),
+                vm_size_t(infoCount) * vm_size_t(MemoryLayout<integer_t>.stride))
         }
-        guard kr == KERN_SUCCESS else { return cpuPercent }  // keep last value on failure
 
-        // cpu_ticks tuple order: (user, system, idle, nice)
-        defer { previousCPUTicks = info }
-        guard let prev = previousCPUTicks else { return 0 }  // first sample: no delta yet
+        let states = Int(CPU_STATE_MAX)  // user, system, idle, nice
+        var current: [[UInt32]] = []
+        current.reserveCapacity(Int(cpuCount))
+        for core in 0..<Int(cpuCount) {
+            let base = core * states
+            current.append([
+                UInt32(bitPattern: info[base + Int(CPU_STATE_USER)]),
+                UInt32(bitPattern: info[base + Int(CPU_STATE_SYSTEM)]),
+                UInt32(bitPattern: info[base + Int(CPU_STATE_IDLE)]),
+                UInt32(bitPattern: info[base + Int(CPU_STATE_NICE)]),
+            ])
+        }
 
-        let userD = Double(info.cpu_ticks.0) - Double(prev.cpu_ticks.0)
-        let systemD = Double(info.cpu_ticks.1) - Double(prev.cpu_ticks.1)
-        let idleD = Double(info.cpu_ticks.2) - Double(prev.cpu_ticks.2)
-        let niceD = Double(info.cpu_ticks.3) - Double(prev.cpu_ticks.3)
+        defer { previousCoreTicks = current }
+        guard let prev = previousCoreTicks, prev.count == current.count else {
+            return Array(repeating: 0, count: current.count)  // first sample: no delta
+        }
 
-        let busy = userD + systemD + niceD
-        let total = busy + idleD
-        guard total > 0 else { return cpuPercent }
-        return min(100, max(0, busy / total * 100))
+        return current.indices.map { i in
+            let c = current[i], p = prev[i]
+            let busy = Double((c[0] &- p[0]) + (c[1] &- p[1]) + (c[3] &- p[3]))  // user+system+nice
+            let total = busy + Double(c[2] &- p[2])                              // + idle
+            return total > 0 ? min(100, max(0, busy / total * 100)) : 0
+        }
     }
 
     /// Percentage of physical RAM in use (active + wired + compressed), via the
@@ -93,8 +126,6 @@ final class StatusBarModel: ObservableObject {
         guard host_page_size(host, &pageSize) == KERN_SUCCESS else { return memoryPercent }
 
         var stats = vm_statistics64_data_t()
-        // HOST_VM_INFO64_COUNT isn't imported into Swift, so derive the count:
-        // the struct, measured in units of integer_t.
         var count = mach_msg_type_number_t(
             MemoryLayout<vm_statistics64_data_t>.stride / MemoryLayout<integer_t>.stride)
         let kr = withUnsafeMutablePointer(to: &stats) { ptr in
@@ -111,6 +142,62 @@ final class StatusBarModel: ObservableObject {
         let total = ProcessInfo.processInfo.physicalMemory
         guard total > 0 else { return memoryPercent }
         return min(100, max(0, Double(used) / Double(total) * 100))
+    }
+
+    /// Used percentage of the boot volume.
+    private func diskUsedPercent() -> Double {
+        let url = URL(fileURLWithPath: "/")
+        guard
+            let vals = try? url.resourceValues(
+                forKeys: [.volumeTotalCapacityKey, .volumeAvailableCapacityForImportantUsageKey]),
+            let total = vals.volumeTotalCapacity, total > 0
+        else { return diskPercent }
+        let available = Double(vals.volumeAvailableCapacityForImportantUsage ?? 0)
+        let used = Double(total) - available
+        return min(100, max(0, used / Double(total) * 100))
+    }
+
+    /// Network throughput (down/up) since the last tick. Byte counters are
+    /// cumulative, so we diff against the previous sample over elapsed time.
+    private func networkRateString() -> String {
+        guard let cur = networkBytes() else { return network }
+        let now = Date()
+        defer { previousNet = cur; previousNetTime = now }
+        guard let prev = previousNet, let prevTime = previousNetTime else { return "↓ 0 ↑ 0" }
+
+        let elapsed = now.timeIntervalSince(prevTime)
+        guard elapsed > 0 else { return network }
+        // Guard against counter wrap (cur < prev): treat as 0 for that interval.
+        let down = cur.inBytes >= prev.inBytes ? Double(cur.inBytes - prev.inBytes) / elapsed : 0
+        let up = cur.outBytes >= prev.outBytes ? Double(cur.outBytes - prev.outBytes) / elapsed : 0
+        return "↓ \(byteRate(down)) ↑ \(byteRate(up))"
+    }
+
+    private func byteRate(_ bytesPerSecond: Double) -> String {
+        byteRateFormatter.string(fromByteCount: Int64(bytesPerSecond)) + "/s"
+    }
+
+    /// Sum of in/out bytes across real interfaces (AF_LINK, excluding loopback).
+    private func networkBytes() -> (inBytes: UInt64, outBytes: UInt64)? {
+        var addrs: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&addrs) == 0 else { return nil }
+        defer { freeifaddrs(addrs) }
+
+        var totalIn: UInt64 = 0
+        var totalOut: UInt64 = 0
+        var cursor = addrs
+        while let c = cursor {
+            let ifa = c.pointee
+            if let addr = ifa.ifa_addr,
+               addr.pointee.sa_family == UInt8(AF_LINK),
+               !String(cString: ifa.ifa_name).hasPrefix("lo"),
+               let data = ifa.ifa_data?.assumingMemoryBound(to: if_data.self) {
+                totalIn += UInt64(data.pointee.ifi_ibytes)
+                totalOut += UInt64(data.pointee.ifi_obytes)
+            }
+            cursor = ifa.ifa_next
+        }
+        return (totalIn, totalOut)
     }
 
     /// Battery percentage (+ a bolt while charging), or nil on machines without a battery.
@@ -149,9 +236,15 @@ struct StatusBarView: View {
             separator
             Label(model.load, systemImage: "speedometer")
             separator
-            StatBar(icon: "cpu", value: model.cpuPercent)
+            PerCoreBars(values: model.perCore)
             separator
             StatBar(icon: "memorychip", value: model.memoryPercent)
+            separator
+            StatBar(icon: "internaldrive", value: model.diskPercent)
+            separator
+            Label(model.network, systemImage: "network")
+            separator
+            Label(model.uptime, systemImage: "power")
             if let battery = model.battery {
                 separator
                 Label(battery, systemImage: "battery.100")
@@ -161,18 +254,26 @@ struct StatusBarView: View {
             Spacer()
         }
         .font(.system(size: 13))
-        .monospacedDigit()          // fixed-width digits so the bar doesn't twitch
+        .monospacedDigit()
         .foregroundStyle(.secondary)
         .lineLimit(1)
         .padding(.horizontal, 12)
-        .padding(.vertical, 6)      // option B: height grows with the font, no clipping
+        .padding(.vertical, 6)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.bar)           // material designed for status/toolbars; adapts to light/dark
+        .background(.bar)
         .overlay(alignment: .top) { Divider() }
     }
 
     private var separator: some View {
         Divider().frame(height: 12)
+    }
+}
+
+private func loadColor(_ value: Double) -> Color {
+    switch value {
+    case ..<60: return .green
+    case ..<85: return .yellow
+    default: return .red
     }
 }
 
@@ -182,17 +283,7 @@ private struct StatBar: View {
     let value: Double           // 0...100
     var segments: Int = 10
 
-    private var filled: Int {
-        Int((value / 100 * Double(segments)).rounded())
-    }
-
-    private var color: Color {
-        switch value {
-        case ..<60: return .green
-        case ..<85: return .yellow
-        default: return .red
-        }
-    }
+    private var filled: Int { Int((value / 100 * Double(segments)).rounded()) }
 
     var body: some View {
         HStack(spacing: 6) {
@@ -200,12 +291,36 @@ private struct StatBar: View {
             HStack(spacing: 1) {
                 ForEach(0..<segments, id: \.self) { i in
                     Rectangle()
-                        .fill(i < filled ? color : Color.secondary.opacity(0.25))
+                        .fill(i < filled ? loadColor(value) : Color.secondary.opacity(0.25))
                         .frame(width: 4, height: 9)
                 }
             }
             Text(String(format: "%.0f%%", value))
                 .frame(width: 34, alignment: .trailing)
+        }
+    }
+}
+
+/// A compact per-core "equalizer": one column per CPU core, filled bottom-up by load.
+private struct PerCoreBars: View {
+    let values: [Double]        // 0...100 per core
+    private let height: CGFloat = 11
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "cpu")
+            HStack(alignment: .bottom, spacing: 2) {
+                ForEach(Array(values.enumerated()), id: \.offset) { _, v in
+                    RoundedRectangle(cornerRadius: 1)
+                        .fill(Color.secondary.opacity(0.25))
+                        .frame(width: 3, height: height)
+                        .overlay(alignment: .bottom) {
+                            RoundedRectangle(cornerRadius: 1)
+                                .fill(loadColor(v))
+                                .frame(width: 3, height: max(1, height * v / 100))
+                        }
+                }
+            }
         }
     }
 }

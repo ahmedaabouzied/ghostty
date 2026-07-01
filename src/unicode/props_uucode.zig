@@ -11,6 +11,7 @@ pub fn get(cp: u21) Properties {
         .width_zero_in_grapheme = true,
         .grapheme_break = .other,
         .emoji_vs_base = false,
+        .bidi_class = .left_to_right,
     };
 
     return .{
@@ -18,6 +19,7 @@ pub fn get(cp: u21) Properties {
         .width_zero_in_grapheme = uucode.get(.wcwidth_zero_in_grapheme, cp),
         .grapheme_break = uucode.get(.grapheme_break_no_control, cp),
         .emoji_vs_base = uucode.get(.is_emoji_vs_base, cp),
+        .bidi_class = uucode.get(.bidi_class, cp),
     };
 }
 
@@ -82,4 +84,29 @@ test "unicode props: tables match uucode" {
             try testing.expect(false);
         }
     }
+}
+
+test "unicode props: bidi_class" {
+    const testing = std.testing;
+    const table = @import("props_table.zig").table;
+    // Latin 'A' -> L (left_to_right)
+    try testing.expectEqual(
+        uucode.types.BidiClass.left_to_right,
+        table.get('A').bidi_class,
+    );
+    // Arabic letter alef U+0627 -> AL (right_to_left_arabic)
+    try testing.expectEqual(
+        uucode.types.BidiClass.right_to_left_arabic,
+        table.get(0x0627).bidi_class,
+    );
+    // Hebrew alef U+05D0 -> R (right_to_left)
+    try testing.expectEqual(
+        uucode.types.BidiClass.right_to_left,
+        table.get(0x05D0).bidi_class,
+    );
+    // Arabic-Indic digit five U+0665 -> AN (arabic_number)
+    try testing.expectEqual(
+        uucode.types.BidiClass.arabic_number,
+        table.get(0x0665).bidi_class,
+    );
 }

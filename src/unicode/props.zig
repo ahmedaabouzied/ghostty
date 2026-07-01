@@ -23,12 +23,17 @@ pub const Properties = packed struct {
     /// Emoji VS compatibility
     emoji_vs_base: bool = false,
 
+    /// Bidirectional character class (Unicode Bidi_Class), used for the
+    /// Unicode Bidirectional Algorithm (RTL/BiDi text).
+    bidi_class: uucode.types.BidiClass = .left_to_right,
+
     // Needed for lut.Generator
     pub fn eql(a: Properties, b: Properties) bool {
         return a.width == b.width and
             a.width_zero_in_grapheme == b.width_zero_in_grapheme and
             a.grapheme_break == b.grapheme_break and
-            a.emoji_vs_base == b.emoji_vs_base;
+            a.emoji_vs_base == b.emoji_vs_base and
+            a.bidi_class == b.bidi_class;
     }
 
     // Needed for lut.Generator
@@ -42,12 +47,14 @@ pub const Properties = packed struct {
             \\    .width_zero_in_grapheme= {},
             \\    .grapheme_break= .{s},
             \\    .emoji_vs_base= {},
+            \\    .bidi_class= .{s},
             \\}}
         , .{
             self.width,
             self.width_zero_in_grapheme,
             @tagName(self.grapheme_break),
             self.emoji_vs_base,
+            @tagName(self.bidi_class),
         });
     }
 };

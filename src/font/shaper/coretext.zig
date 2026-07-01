@@ -54,7 +54,12 @@ pub const Shaper = struct {
     /// Cached attributes dict for creating CTTypesetter objects.
     /// The values in this never change so we can avoid overhead
     /// by just creating it once and saving it for reuse.
+    ///
+    /// `typesetter_attr_dict` forces embedding level 0 (LTR);
+    /// `typesetter_attr_dict_rtl` forces embedding level 1 (RTL). We pick
+    /// between them per run based on the run's resolved bidi direction.
     typesetter_attr_dict: *macos.foundation.Dictionary,
+    typesetter_attr_dict_rtl: *macos.foundation.Dictionary,
 
     /// List where we cache fonts, so we don't have to remake them for
     /// every single shaping operation.
@@ -201,6 +206,18 @@ pub const Shaper = struct {
         };
         errdefer typesetter_attr_dict.release();
 
+        // The RTL counterpart forces embedding level 1 so that RTL runs
+        // (Arabic, Hebrew) are laid out right-to-left.
+        const typesetter_attr_dict_rtl = dict: {
+            const num = try macos.foundation.Number.create(.int, &1);
+            defer num.release();
+            break :dict try macos.foundation.Dictionary.create(
+                &.{macos.c.kCTTypesetterOptionForcedEmbeddingLevel},
+                &.{num},
+            );
+        };
+        errdefer typesetter_attr_dict_rtl.release();
+
         // Create the CF release thread.
         var cf_release_thread = try alloc.create(CFReleaseThread);
         errdefer alloc.destroy(cf_release_thread);
@@ -222,6 +239,7 @@ pub const Shaper = struct {
             .features = features,
             .features_no_default = features_no_default,
             .typesetter_attr_dict = typesetter_attr_dict,
+            .typesetter_attr_dict_rtl = typesetter_attr_dict_rtl,
             .cached_fonts = .{},
             .cached_font_grid = 0,
             .cf_release_pool = .{},
@@ -236,6 +254,7 @@ pub const Shaper = struct {
         self.features.release();
         self.features_no_default.release();
         self.typesetter_attr_dict.release();
+        self.typesetter_attr_dict_rtl.release();
 
         {
             for (self.cached_fonts.items) |ft| {
@@ -372,10 +391,16 @@ pub const Shaper = struct {
 
         // Create a typesetter from the attributed string and the cached
         // attr dict. (See comment in init for more info on the attr dict.)
+        // We pick the LTR or RTL embedding-level dict based on the run's
+        // resolved direction.
+        const typesetter_dict = if (run.direction == .rtl)
+            self.typesetter_attr_dict_rtl
+        else
+            self.typesetter_attr_dict;
         const typesetter =
             try macos.text.Typesetter.createWithAttributedStringAndOptions(
                 attr_str,
-                self.typesetter_attr_dict,
+                typesetter_dict,
             );
         self.cf_release_pool.appendAssumeCapacity(typesetter);
 
@@ -384,8 +409,15 @@ pub const Shaper = struct {
         self.cf_release_pool.appendAssumeCapacity(line);
 
         // This keeps track of the current x offset (sum of advance.width) and
-        // the furthest cluster we've seen so far (max).
+        // the furthest cluster we've seen so far (max for LTR, min for RTL).
         var run_offset: Offset = .{};
+
+        // For RTL runs the glyphs come out in visual (left-to-right) order,
+        // which means their clusters DESCEND as we iterate. The cluster-reset
+        // heuristics below are written for ascending clusters, so we mirror
+        // the comparisons for RTL and seed the frontier at the maximum.
+        const rtl = run.direction == .rtl;
+        if (rtl) run_offset.cluster = std.math.maxInt(u32);
 
         // This keeps track of the cell starting x and cluster.
         var cell_offset: Offset = .{};
@@ -442,7 +474,9 @@ pub const Shaper = struct {
                     // See e.g. the "shape Chakma vowel sign with ligature
                     // (vowel sign renders first)" test.
 
-                    const is_after_glyph_from_current_or_next_clusters =
+                    const is_after_glyph_from_current_or_next_clusters = if (rtl)
+                        cluster >= run_offset.cluster
+                    else
                         cluster <= run_offset.cluster;
 
                     const is_first_codepoint_in_cluster = blk: {
@@ -513,7 +547,10 @@ pub const Shaper = struct {
                 // Add our advances to keep track of our run offsets.
                 // Advances apply to the NEXT cell.
                 run_offset.x += advance.width;
-                run_offset.cluster = @max(run_offset.cluster, cluster);
+                run_offset.cluster = if (rtl)
+                    @min(run_offset.cluster, cluster)
+                else
+                    @max(run_offset.cluster, cluster);
 
                 // For debugging positions, turn this on:
                 //run_offset_y += advance.height;
@@ -521,11 +558,17 @@ pub const Shaper = struct {
         }
 
         // If our buffer contains some non-ltr sections we need to sort it :/
+        //
+        // This also normalizes intentionally-RTL runs into logical order
+        // (ascending cell.x): the renderer then maps each logical column to
+        // its visual column using the row's bidi levels. Keeping the shaper
+        // output in logical order lets the renderer's glyph placement stay
+        // uniform for LTR and RTL.
         if (non_ltr) {
-            // This is EXCEPTIONALLY rare. Only happens for languages with
-            // complex shaping which we don't even really support properly
-            // right now, so are very unlikely to be used heavily by users
-            // of Ghostty.
+            // This is EXCEPTIONALLY rare for LTR runs. Only happens for
+            // languages with complex shaping which we don't even really
+            // support properly right now, so are very unlikely to be used
+            // heavily by users of Ghostty.
             @branchHint(.cold);
             std.mem.sort(
                 font.shape.Cell,
@@ -2515,6 +2558,127 @@ test "shape high plane sprite font codepoint" {
     try testing.expectEqual(null, try it.next(alloc));
 }
 
+test "shape: runs break on bidi level change" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaper(alloc);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 30, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("abcABC");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    // Force LTR (level 0) for the first three cells and RTL (level 1) for
+    // the next three. The run iterator must split at the boundary and tag
+    // each run with the matching direction.
+    var levels = [_]u8{0} ** 30;
+    levels[3] = 1;
+    levels[4] = 1;
+    levels[5] = 1;
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+        .bidi_levels = &levels,
+    });
+
+    const run0 = (try it.next(alloc)).?;
+    try testing.expectEqual(@as(u16, 0), run0.offset);
+    try testing.expectEqual(@as(u16, 3), run0.cells);
+    try testing.expectEqual(font.shape.Direction.ltr, run0.direction);
+
+    const run1 = (try it.next(alloc)).?;
+    try testing.expectEqual(@as(u16, 3), run1.offset);
+    try testing.expectEqual(@as(u16, 3), run1.cells);
+    try testing.expectEqual(font.shape.Direction.rtl, run1.direction);
+
+    try testing.expect((try it.next(alloc)) == null);
+}
+
+// The counterpart to "shape arabic forced LTR": providing RTL bidi levels
+// tags the run RTL and shapes it right-to-left. The shaped cells are returned
+// in logical (ascending x) order for the renderer, but the glyph sequence
+// differs from the forced-LTR result, proving the direction took effect.
+test "shape arabic RTL differs from LTR and is in logical order" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 120, .rows = 30 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice(@embedFile("testdata/arabic.txt"));
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+
+    // Shape forced-LTR (no bidi levels) and record the glyph sequence.
+    var ltr_glyphs: [256]u32 = undefined;
+    var ltr_len: usize = 0;
+    {
+        var it = shaper.runIterator(.{
+            .grid = testdata.grid,
+            .cells = state.row_data.get(0).cells.slice(),
+        });
+        const run = (try it.next(alloc)).?;
+        try testing.expectEqual(font.shape.Direction.ltr, run.direction);
+        const cells = try shaper.shape(run);
+        for (cells) |c| {
+            ltr_glyphs[ltr_len] = c.glyph_index;
+            ltr_len += 1;
+        }
+    }
+
+    // Shape RTL (force embedding level 1).
+    var levels = [_]u8{1} ** 120;
+    {
+        var it = shaper.runIterator(.{
+            .grid = testdata.grid,
+            .cells = state.row_data.get(0).cells.slice(),
+            .bidi_levels = &levels,
+        });
+        const run = (try it.next(alloc)).?;
+        try testing.expectEqual(font.shape.Direction.rtl, run.direction);
+        const cells = try shaper.shape(run);
+        try testing.expect(cells.len > 0);
+
+        // The renderer relies on shaped cells being in logical (ascending)
+        // order; visual reordering is applied later using the bidi levels.
+        for (cells[1..], cells[0 .. cells.len - 1]) |c, prev| {
+            try testing.expect(c.x >= prev.x);
+        }
+
+        // Direction actually affected shaping: the RTL glyph sequence is not
+        // identical to the forced-LTR one (different joining/ligatures).
+        var differs = cells.len != ltr_len;
+        if (!differs) {
+            for (cells, 0..) |c, i| {
+                if (c.glyph_index != ltr_glyphs[i]) {
+                    differs = true;
+                    break;
+                }
+            }
+        }
+        try testing.expect(differs);
+    }
+}
+
 const TestShaper = struct {
     alloc: Allocator,
     shaper: Shaper,
@@ -2530,6 +2694,7 @@ const TestShaper = struct {
 };
 
 const TestFont = enum {
+    arabic,
     code_new_roman,
     geist_mono,
     inconsolata,
@@ -2547,6 +2712,7 @@ fn testShaperWithFont(alloc: Allocator, font_req: TestFont) !TestShaper {
     const testEmoji = font.embedded.emoji;
     const testEmojiText = font.embedded.emoji_text;
     const testFont = switch (font_req) {
+        .arabic => font.embedded.arabic,
         .code_new_roman => font.embedded.code_new_roman,
         .inconsolata => font.embedded.inconsolata,
         .geist_mono => font.embedded.geist_mono,

@@ -119,6 +119,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// shaders to update their state.
         custom_shader_focused_changed: bool = false,
 
+        /// The visual column of the cursor for the frame currently being
+        /// built, when the cursor's row contains right-to-left text. Set while
+        /// rebuilding the cursor's row and consumed when placing the cursor.
+        /// Null means the cursor is at its logical column (the common case).
+        bidi_cursor_visual_x: ?terminal.size.CellCountInt = null,
+
         /// The most recent scrollbar state. We use this as a cache to
         /// determine if we need to notify the apprt that there was a
         /// scrollbar change.
@@ -2403,6 +2409,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
             } else null;
 
+            // Reset the per-frame bidi cursor position. rebuildRow sets this
+            // when it rebuilds the cursor's row and that row has RTL content.
+            self.bidi_cursor_visual_x = null;
+
             for (
                 0..,
                 row_raws[0..row_len],
@@ -2510,6 +2520,25 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     break :cursor_color state.colors.foreground;
                 };
 
+                // Under bidi, compute the cursor's visual column for its row so
+                // it is drawn where the reordered text actually is. This runs
+                // every frame the cursor is shown, independent of whether the
+                // cursor's row was rebuilt this frame.
+                self.bidi_cursor_visual_x = bidi_cursor: {
+                    if (cursor_vp.y >= row_cells.len) break :bidi_cursor null;
+                    const cursor_cells = row_cells[cursor_vp.y].slice();
+                    const cursor_raw = cursor_cells.items(.raw);
+                    const clamped_len = @min(cursor_raw.len, self.cells.size.columns);
+                    if (cursor_vp.x >= clamped_len) break :bidi_cursor null;
+                    var result = (self.computeRowBidi(cursor_raw[0..clamped_len]) catch
+                        break :bidi_cursor null) orelse break :bidi_cursor null;
+                    defer result.deinit(self.alloc);
+                    for (result.visual_to_logical, 0..) |lidx, v| {
+                        if (lidx == cursor_vp.x) break :bidi_cursor @intCast(v);
+                    }
+                    break :bidi_cursor null;
+                };
+
                 self.addCursor(
                     &state.cursor,
                     style,
@@ -2521,10 +2550,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const wide = state.cursor.cell.wide;
 
                     self.uniforms.cursor_pos = .{
-                        // If we are a spacer tail of a wide cell, our cursor needs
-                        // to move back one cell. The saturate is to ensure we don't
-                        // overflow but this shouldn't happen with well-formed input.
-                        switch (wide) {
+                        // Under bidi, use the cursor's visual column. Otherwise,
+                        // if we are a spacer tail of a wide cell, our cursor
+                        // needs to move back one cell. The saturate is to ensure
+                        // we don't overflow but this shouldn't happen with
+                        // well-formed input.
+                        self.bidi_cursor_visual_x orelse switch (wide) {
                             .narrow, .spacer_head, .wide => cursor_vp.x,
                             .spacer_tail => cursor_vp.x -| 1,
                         },
@@ -2607,6 +2638,46 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // });
         }
 
+        /// Whether a row contains any right-to-left content and therefore
+        /// needs the bidi algorithm. Pure-LTR rows skip bidi entirely so
+        /// there is no added cost for the common case.
+        fn rowNeedsBidi(cells: []const terminal.Cell) bool {
+            for (cells) |*cell| {
+                if (terminal.bidi.isRTLClass(cell.codepoint())) return true;
+            }
+            return false;
+        }
+
+        /// Compute the bidi reordering for a row's raw cells, or null if the
+        /// row has no right-to-left content (so no reordering is needed). The
+        /// caller owns the returned Result and must `deinit` it.
+        fn computeRowBidi(
+            self: *Self,
+            cells_raw: []const terminal.Cell,
+        ) !?terminal.bidi.Result {
+            if (!rowNeedsBidi(cells_raw)) return null;
+
+            // One codepoint per column. Empty cells become spaces (neutral) so
+            // that trailing blanks don't extend an RTL run to the end of the
+            // row — as whitespace they reset to the base direction (UAX #9 L1).
+            // Wide-char spacer cells instead inherit the preceding base
+            // codepoint so they stay attached to their wide character after
+            // reordering.
+            const cps = try self.alloc.alloc(u21, cells_raw.len);
+            defer self.alloc.free(cps);
+            for (cells_raw, 0..) |*c, i| {
+                const cp = c.codepoint();
+                cps[i] = if (cp != 0)
+                    cp
+                else if (c.wide == .spacer_tail and i > 0)
+                    cps[i - 1]
+                else
+                    ' ';
+            }
+
+            return try terminal.bidi.reorder(self.alloc, cps, .auto);
+        }
+
         fn rebuildRow(
             self: *Self,
             y: terminal.size.CellCountInt,
@@ -2655,11 +2726,45 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 },
             }
 
+            // Compute bidi (RTL) visual ordering for this row. Rows with no
+            // right-to-left content skip this entirely, so pure-LTR text has
+            // zero added cost and byte-for-byte identical behavior.
+            //
+            // `bidi_levels` are the per-column embedding levels handed to the
+            // run iterator so it can break runs by direction and shape RTL
+            // runs right-to-left. `logical_to_visual` maps each logical column
+            // to the visual column where its contents should be drawn.
+            var bidi_levels: ?[]const u8 = null;
+            var logical_to_visual: ?[]const u16 = null;
+            defer if (bidi_levels) |b| self.alloc.free(b);
+            defer if (logical_to_visual) |m| self.alloc.free(m);
+            compute_bidi: {
+                var result = (self.computeRowBidi(cells_raw[0..cells_len]) catch
+                    break :compute_bidi) orelse break :compute_bidi;
+
+                // Invert visual_to_logical to get logical_to_visual, which is
+                // what the render loop needs.
+                const l2v = self.alloc.alloc(u16, cells_len) catch {
+                    result.deinit(self.alloc);
+                    break :compute_bidi;
+                };
+                for (result.visual_to_logical, 0..) |lidx, v| {
+                    l2v[lidx] = @intCast(v);
+                }
+
+                // Transfer ownership of levels; drop visual_to_logical since we
+                // only need its inverse.
+                bidi_levels = result.levels;
+                self.alloc.free(result.visual_to_logical);
+                logical_to_visual = l2v;
+            }
+
             // Iterator of runs for shaping.
             var run_iter_opts: font.shape.RunOptions = .{
                 .grid = self.font_grid,
                 .cells = cells_slice,
                 .selection = if (selection) |s| s else null,
+                .bidi_levels = bidi_levels,
 
                 // We want to do font shaping as long as the cursor is
                 // visible on this viewport.
@@ -2741,6 +2846,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         shaper_cells_i += 1;
                     }
                 }
+
+                // The visual column where this logical cell's contents are
+                // drawn. Equal to x for pure-LTR rows; remapped under bidi.
+                const vx: terminal.size.CellCountInt = if (logical_to_visual) |m|
+                    m[x]
+                else
+                    @intCast(x);
 
                 const wide = cell.wide;
                 const style: terminal.Style = if (cell.hasStyling())
@@ -2910,7 +3022,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         break :bg_alpha 0;
                     };
 
-                    self.cells.bgCell(y, x).* = .{
+                    self.cells.bgCell(y, vx).* = .{
                         rgb.r, rgb.g, rgb.b, bg_alpha,
                     };
                 }
@@ -2947,7 +3059,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // This improves readability when a colored underline is used
                 // which intersects parts of the text (descenders).
                 if (underline != .none) self.addUnderline(
-                    @intCast(x),
+                    vx,
                     @intCast(y),
                     underline,
                     style.underlineColor(&state.colors.palette) orelse fg,
@@ -2959,7 +3071,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     );
                 };
 
-                if (style.flags.overline) self.addOverline(@intCast(x), @intCast(y), fg, alpha) catch |err| {
+                if (style.flags.overline) self.addOverline(vx, @intCast(y), fg, alpha) catch |err| {
                     log.warn(
                         "error adding overline to cell, will be invalid x={} y={}, err={}",
                         .{ x, y, err },
@@ -3024,6 +3136,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     }) {
                         self.addGlyph(
                             @intCast(x),
+                            vx,
                             @intCast(y),
                             state.cols,
                             cells_raw,
@@ -3042,7 +3155,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Finally, draw a strikethrough if necessary.
                 if (style.flags.strikethrough) self.addStrikethrough(
-                    @intCast(x),
+                    vx,
                     @intCast(y),
                     fg,
                     alpha,
@@ -3159,9 +3272,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         }
 
         // Add a glyph to the specified cell.
+        //
+        // `x` is the logical column (used to look up the cell and its
+        // constraint neighbors); `grid_x` is the visual column where the
+        // glyph is actually drawn. They differ only under bidi.
         fn addGlyph(
             self: *Self,
             x: terminal.size.CellCountInt,
+            grid_x: terminal.size.CellCountInt,
             y: terminal.size.CellCountInt,
             cols: usize,
             cell_raws: []const terminal.page.Cell,
@@ -3210,7 +3328,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .text => .grayscale,
                 },
                 .bools = .{ .no_min_contrast = noMinContrast(cp) },
-                .grid_pos = .{ @intCast(x), @intCast(y) },
+                .grid_pos = .{ @intCast(grid_x), @intCast(y) },
                 .color = .{ color.r, color.g, color.b, alpha },
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },
@@ -3296,10 +3414,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 },
             };
 
+            // Under bidi the cursor's row is visually reordered, so draw the
+            // cursor at the visual column recorded during row rebuild.
+            const grid_x = self.bidi_cursor_visual_x orelse x;
+
             self.cells.setCursor(.{
                 .atlas = .grayscale,
                 .bools = .{ .is_cursor_glyph = true },
-                .grid_pos = .{ x, cursor_vp.y },
+                .grid_pos = .{ grid_x, cursor_vp.y },
                 .color = .{ cursor_color.r, cursor_color.g, cursor_color.b, alpha },
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },

@@ -104,6 +104,7 @@ pub const tables = [_]config.Table{
             grapheme_break_no_control.field("grapheme_break_no_control"),
             is_symbol.field("is_symbol"),
             d.field("is_emoji_vs_base"),
+            d.field("bidi_class"),
         },
     },
 };

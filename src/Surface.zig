@@ -3837,7 +3837,7 @@ pub fn mouseButtonCallback(
         // gesture can conservatively treat the release as having moved away
         // from the pressed cell.
         const release_pin: ?terminal.Pin = if (release_pos) |pos| pin: {
-            const release_vp = self.posToViewport(pos.x, pos.y);
+            const release_vp = self.viewportVisualToLogical(self.posToViewport(pos.x, pos.y));
             break :pin self.io.terminal.screens.active.pages.pin(.{ .viewport = .{
                 .x = release_vp.x,
                 .y = release_vp.y,
@@ -3944,7 +3944,7 @@ pub fn mouseButtonCallback(
 
         const pos = try self.rt_surface.getCursorPos();
         const pin = pin: {
-            const pt_viewport = self.posToViewport(pos.x, pos.y);
+            const pt_viewport = self.viewportVisualToLogical(self.posToViewport(pos.x, pos.y));
             const pin = screen.pages.pin(.{
                 .viewport = .{
                     .x = pt_viewport.x,
@@ -4054,7 +4054,7 @@ pub fn mouseButtonCallback(
         const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
         const pos = try self.rt_surface.getCursorPos();
         const pin = pin: {
-            const pt_viewport = self.posToViewport(pos.x, pos.y);
+            const pt_viewport = self.viewportVisualToLogical(self.posToViewport(pos.x, pos.y));
             const pin = screen.pages.pin(.{
                 .viewport = .{
                     .x = pt_viewport.x,
@@ -4652,12 +4652,14 @@ pub fn cursorPosCallback(
         // All roads lead to requiring a re-render at this point.
         try self.queueRender();
 
-        // Convert to points
+        // Convert to points. Map the visual mouse column to its logical
+        // column so drag selection tracks the reordered (bidi) text.
         const screen: *terminal.Screen = t.screens.active;
+        const drag_vp = self.viewportVisualToLogical(pos_vp);
         const pin = screen.pages.pin(.{
             .viewport = .{
-                .x = pos_vp.x,
-                .y = pos_vp.y,
+                .x = drag_vp.x,
+                .y = drag_vp.y,
             },
         }) orelse {
             if (comptime std.debug.runtime_safety) unreachable;
@@ -4728,6 +4730,63 @@ pub fn posToViewport(self: Surface, xpos: f64, ypos: f64) terminal.point.Coordin
     const coord: rendererpkg.Coordinate = .{ .surface = .{ .x = xpos, .y = ypos } };
     const grid = coord.convert(.grid, self.size).grid;
     return .{ .x = grid.x, .y = grid.y };
+}
+
+/// Remap a viewport coordinate from a visual (rendered) column to the logical
+/// column, using the bidi reordering of its row. The renderer draws cells at
+/// visual columns, but the terminal's data model (selections, pins) is logical,
+/// so a mouse position must be mapped back. Rows with no right-to-left content
+/// are returned unchanged.
+///
+/// The caller MUST hold the renderer mutex because this reads the active
+/// screen.
+fn viewportVisualToLogical(
+    self: *Surface,
+    vp: terminal.point.Coordinate,
+) terminal.point.Coordinate {
+    const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
+    const row_pin = screen.pages.pin(.{ .viewport = .{
+        .x = 0,
+        .y = vp.y,
+    } }) orelse return vp;
+    const cols: usize = row_pin.node.data.size.cols;
+    if (vp.x >= cols) return vp;
+
+    // Collect the row's codepoints, mirroring the renderer's bidi input:
+    // empty cells become spaces, wide-char spacers inherit the base codepoint.
+    const cps = self.alloc.alloc(u21, cols) catch return vp;
+    defer self.alloc.free(cps);
+
+    var has_rtl = false;
+    var it = row_pin.cellIterator(.right_down, null);
+    var i: usize = 0;
+    while (i < cols) : (i += 1) {
+        const p = it.next() orelse break;
+        // Stop if the iterator wrapped past the end of this row.
+        if (p.node != row_pin.node or p.y != row_pin.y) break;
+        const cell = p.rowAndCell().cell;
+        const cp = cell.codepoint();
+        cps[i] = if (cp != 0)
+            cp
+        else if (cell.wide == .spacer_tail and i > 0)
+            cps[i - 1]
+        else
+            ' ';
+        if (terminal.bidi.isRTLClass(cps[i])) has_rtl = true;
+    }
+    // Pad any unread columns as spaces (neutral).
+    while (i < cols) : (i += 1) cps[i] = ' ';
+
+    // No RTL content: the visual and logical columns are identical.
+    if (!has_rtl) return vp;
+
+    var result = terminal.bidi.reorder(self.alloc, cps, .auto) catch return vp;
+    defer result.deinit(self.alloc);
+    if (vp.x < result.visual_to_logical.len) return .{
+        .x = @intCast(result.visual_to_logical[vp.x]),
+        .y = vp.y,
+    };
+    return vp;
 }
 
 /// Scroll to the bottom of the viewport.

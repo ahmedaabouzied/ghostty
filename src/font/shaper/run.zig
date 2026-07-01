@@ -7,6 +7,10 @@ const terminal = @import("../../terminal/main.zig");
 const autoHash = std.hash.autoHash;
 const Hasher = std.hash.Wyhash;
 
+/// The resolved direction of a text run, derived from its bidi embedding
+/// level (even = left-to-right, odd = right-to-left).
+pub const Direction = enum { ltr, rtl };
+
 /// A single text run. A text run is only valid for one Shaper instance and
 /// until the next run is created. A text run never goes across multiple
 /// rows in a terminal, so it is guaranteed to always be one line.
@@ -36,6 +40,11 @@ pub const TextRun = struct {
 
     /// The font index to use for the glyphs of this run.
     font_index: font.Collection.Index,
+
+    /// The resolved bidi direction for this run. The shaper shapes the run in
+    /// this direction and the renderer reorders it accordingly. Defaults to
+    /// left-to-right when no bidi levels are provided.
+    direction: Direction = .ltr,
 };
 
 /// RunIterator is an iterator that yields text runs.
@@ -72,6 +81,15 @@ pub const RunIterator = struct {
         // Track the font for our current run
         var current_font: font.Collection.Index = .{};
 
+        // The bidi embedding level for this run is the level of its first
+        // cell. All cells within a run share the same level because we break
+        // the run whenever the level changes (see below).
+        const run_level: u8 = if (self.opts.bidi_levels) |levels|
+            (if (self.i < levels.len) levels[self.i] else 0)
+        else
+            0;
+        const direction: Direction = if (run_level & 1 == 1) .rtl else .ltr;
+
         // Allow the hook to prepare
         self.hooks.prepare();
 
@@ -104,6 +122,12 @@ pub const RunIterator = struct {
             switch (cell.wide) {
                 .narrow, .wide => {},
                 .spacer_head, .spacer_tail => continue,
+            }
+
+            // If the bidi embedding level changes, split the run so that each
+            // run has a single direction for shaping and visual reordering.
+            if (self.opts.bidi_levels) |levels| {
+                if (j < levels.len and levels[j] != run_level) break;
             }
 
             // If our cell attributes are changing, then we split the run.
@@ -291,6 +315,10 @@ pub const RunIterator = struct {
         // Add our font index
         autoHash(&hasher, current_font);
 
+        // Add our direction so LTR and RTL runs of otherwise identical
+        // content don't share a shaping cache entry.
+        autoHash(&hasher, run_level);
+
         // Move our cursor. Must defer since we use self.i below.
         defer self.i = j;
 
@@ -300,6 +328,7 @@ pub const RunIterator = struct {
             .cells = @intCast(j - self.i),
             .grid = self.opts.grid,
             .font_index = current_font,
+            .direction = direction,
         };
     }
 

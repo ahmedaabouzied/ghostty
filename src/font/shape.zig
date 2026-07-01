@@ -12,6 +12,7 @@ pub const web_canvas = @import("shaper/web_canvas.zig");
 pub const Cache = @import("shaper/Cache.zig");
 pub const TextRun = run.TextRun;
 pub const RunIterator = run.RunIterator;
+pub const Direction = run.Direction;
 pub const Feature = feature.Feature;
 pub const FeatureList = feature.FeatureList;
 pub const default_features = feature.default_features;
@@ -83,6 +84,12 @@ pub const RunOptions = struct {
     /// on cursor boundaries. This can be disabled by setting this to
     /// null.
     cursor_x: ?usize = null,
+
+    /// Per-column bidi embedding levels for this row (UAX #9), indexed by
+    /// cell/column. When set, the run iterator breaks runs at level
+    /// boundaries and tags each run with its resolved direction. When null,
+    /// all text is treated as left-to-right (no bidi reordering).
+    bidi_levels: ?[]const u8 = null,
 
     /// Apply the font break configuration to the run.
     pub fn applyBreakConfig(

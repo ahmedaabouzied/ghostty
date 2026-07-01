@@ -145,6 +145,11 @@ pub const Shaper = struct {
                 break :i default_features.len;
             };
 
+            // Set the shaping direction for this run. This overrides the
+            // default LTR set during buffer preparation, letting RTL runs
+            // (Arabic, Hebrew) shape right-to-left.
+            self.hb_buf.setDirection(if (run.direction == .rtl) .rtl else .ltr);
+
             harfbuzz.shape(face.hb_font, self.hb_buf, self.hb_feats[i..]);
         }
 
@@ -159,8 +164,16 @@ pub const Shaper = struct {
         assert(info.len == pos.len);
 
         // This keeps track of the current x and y offsets (sum of advances)
-        // and the furthest cluster we've seen so far (max).
+        // and the furthest cluster we've seen so far (max for LTR, min for RTL).
         var run_offset: RunOffset = .{};
+
+        // For RTL runs the glyphs come out in visual (left-to-right) order, so
+        // their clusters DESCEND as we iterate. The cluster-reset heuristics
+        // below assume ascending clusters, so we mirror the comparisons for
+        // RTL and seed the frontier at the maximum. (The CoreText shaper does
+        // the same.)
+        const rtl = run.direction == .rtl;
+        if (rtl) run_offset.cluster = std.math.maxInt(u32);
 
         // This keeps track of the cell starting x and cluster.
         var cell_offset: CellOffset = .{};
@@ -175,7 +188,9 @@ pub const Shaper = struct {
             // then we need to reset our current cell offsets.
             const cluster = self.codepoints.items[index].cluster;
             if (cell_offset.cluster != cluster) {
-                const is_after_glyph_from_current_or_next_clusters =
+                const is_after_glyph_from_current_or_next_clusters = if (rtl)
+                    cluster >= run_offset.cluster
+                else
                     cluster <= run_offset.cluster;
 
                 const is_first_codepoint_in_cluster = blk: {
@@ -248,12 +263,27 @@ pub const Shaper = struct {
             // whole value here.
             run_offset.x += (pos_v.x_advance + 0b100_000) >> 6;
             run_offset.y += (pos_v.y_advance + 0b100_000) >> 6;
-            run_offset.cluster = @max(run_offset.cluster, cluster);
+            run_offset.cluster = if (rtl)
+                @min(run_offset.cluster, cluster)
+            else
+                @max(run_offset.cluster, cluster);
 
             // const i = self.cell_buf.items.len - 1;
             // log.warn("i={} info={} pos={} cell={}", .{ i, info_v, pos_v, self.cell_buf.items[i] });
         }
         //log.warn("----------------", .{});
+
+        // RTL runs come out of HarfBuzz in visual order (descending cell.x).
+        // Sort them into logical order (ascending cell.x) so the renderer can
+        // map each cell to its visual column uniformly, matching the CoreText
+        // shaper's behavior.
+        if (run.direction == .rtl) {
+            std.mem.sort(font.shape.Cell, self.cell_buf.items, {}, struct {
+                fn lessThan(_: void, a: font.shape.Cell, b: font.shape.Cell) bool {
+                    return a.x < b.x;
+                }
+            }.lessThan);
+        }
 
         return self.cell_buf.items;
     }
@@ -758,6 +788,127 @@ test "shape arabic forced LTR" {
         }
     }
     try testing.expectEqual(@as(usize, 1), count);
+}
+
+test "shape: runs break on bidi level change" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaper(alloc);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 30, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("abcABC");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    // Force LTR (level 0) for the first three cells and RTL (level 1) for
+    // the next three. The run iterator must split at the boundary and tag
+    // each run with the matching direction.
+    var levels = [_]u8{0} ** 30;
+    levels[3] = 1;
+    levels[4] = 1;
+    levels[5] = 1;
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+        .bidi_levels = &levels,
+    });
+
+    const run0 = (try it.next(alloc)).?;
+    try testing.expectEqual(@as(u16, 0), run0.offset);
+    try testing.expectEqual(@as(u16, 3), run0.cells);
+    try testing.expectEqual(font.shape.Direction.ltr, run0.direction);
+
+    const run1 = (try it.next(alloc)).?;
+    try testing.expectEqual(@as(u16, 3), run1.offset);
+    try testing.expectEqual(@as(u16, 3), run1.cells);
+    try testing.expectEqual(font.shape.Direction.rtl, run1.direction);
+
+    try testing.expect((try it.next(alloc)) == null);
+}
+
+// The counterpart to "shape arabic forced LTR": providing RTL bidi levels
+// tags the run RTL and shapes it right-to-left. The shaped cells are returned
+// in logical (ascending x) order for the renderer, but the glyph sequence
+// differs from the forced-LTR result, proving the direction took effect.
+test "shape arabic RTL differs from LTR and is in logical order" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 120, .rows = 30 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice(@embedFile("testdata/arabic.txt"));
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+
+    // Shape forced-LTR (no bidi levels) and record the glyph sequence.
+    var ltr_glyphs: [256]u32 = undefined;
+    var ltr_len: usize = 0;
+    {
+        var it = shaper.runIterator(.{
+            .grid = testdata.grid,
+            .cells = state.row_data.get(0).cells.slice(),
+        });
+        const run = (try it.next(alloc)).?;
+        try testing.expectEqual(font.shape.Direction.ltr, run.direction);
+        const cells = try shaper.shape(run);
+        for (cells) |c| {
+            ltr_glyphs[ltr_len] = c.glyph_index;
+            ltr_len += 1;
+        }
+    }
+
+    // Shape RTL (force embedding level 1).
+    var levels = [_]u8{1} ** 120;
+    {
+        var it = shaper.runIterator(.{
+            .grid = testdata.grid,
+            .cells = state.row_data.get(0).cells.slice(),
+            .bidi_levels = &levels,
+        });
+        const run = (try it.next(alloc)).?;
+        try testing.expectEqual(font.shape.Direction.rtl, run.direction);
+        const cells = try shaper.shape(run);
+        try testing.expect(cells.len > 0);
+
+        // The renderer relies on shaped cells being in logical (ascending)
+        // order; visual reordering is applied later using the bidi levels.
+        for (cells[1..], cells[0 .. cells.len - 1]) |c, prev| {
+            try testing.expect(c.x >= prev.x);
+        }
+
+        // Direction actually affected shaping: the RTL glyph sequence is not
+        // identical to the forced-LTR one (different joining/ligatures).
+        var differs = cells.len != ltr_len;
+        if (!differs) {
+            for (cells, 0..) |c, i| {
+                if (c.glyph_index != ltr_glyphs[i]) {
+                    differs = true;
+                    break;
+                }
+            }
+        }
+        try testing.expect(differs);
+    }
 }
 
 test "shape emoji width" {

@@ -719,6 +719,7 @@ fn actionCommands(action: Action.Key) []const Command {
         .write_scrollback_file,
         .goto_tab,
         .resize_split,
+        .fallthrough,
         .activate_key_table,
         .activate_key_table_once,
         .deactivate_key_table,

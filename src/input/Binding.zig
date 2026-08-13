@@ -438,6 +438,24 @@ pub const Action = union(enum) {
     /// Select all text on the screen.
     select_all,
 
+    /// Decline to handle the key in this key table, so that lookup
+    /// continues outward to the next active table and finally to the
+    /// default set.
+    ///
+    /// This is only useful inside a key table, and it exists to make
+    /// `catch_all` usable. A table that swallows unbound keys with
+    /// `catch_all=ignore` also swallows keys that carry modifiers, because
+    /// `catch_all` is matched again with the modifiers stripped. That takes
+    /// out application shortcuts such as closing a tab while the table is
+    /// active. Binding `catch_all` for a given set of modifiers to this
+    /// action lets those keys through while unmodified keys stay swallowed:
+    ///
+    ///     keybind = mytable/catch_all=ignore
+    ///     keybind = mytable/super+catch_all=fallthrough
+    ///
+    /// In the default set this behaves as though the key were unbound.
+    fallthrough,
+
     /// Enter keyboard selection mode.
     ///
     /// This activates the `selection` key table and starts a selection at
@@ -1439,6 +1457,7 @@ pub const Action = union(enum) {
             .set_tab_title,
             .clear_screen,
             .select_all,
+            .fallthrough,
             .enter_selection_mode,
             .start_selection,
             .selection_anchor,

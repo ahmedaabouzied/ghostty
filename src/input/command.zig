@@ -241,6 +241,12 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Select all text on the screen.",
         }},
 
+        .enter_selection_mode => comptime &.{.{
+            .action = .enter_selection_mode,
+            .title = "Enter Selection Mode",
+            .description = "Select text using the keyboard.",
+        }},
+
         .start_selection => comptime &.{.{
             .action = .start_selection,
             .title = "Start Selection",

@@ -7227,7 +7227,7 @@ pub const Keybinds = struct {
             );
         }
 
-        // Keyboard selection, i.e. "copy mode". This is a key table so that
+        // Keyboard selection mode. This is a key table so that
         // the motions can be unmodified keys without those keys reaching
         // the terminal. See the key table documentation on `keybind`.
         //
@@ -7238,10 +7238,10 @@ pub const Keybinds = struct {
         // recursion makes the error sets unresolvable.
         {
             const table = table: {
-                const gop = try self.tables.getOrPut(alloc, "copy");
+                const gop = try self.tables.getOrPut(alloc, "selection");
                 if (!gop.found_existing) {
                     // Table names are expected to live in the arena.
-                    gop.key_ptr.* = try alloc.dupe(u8, "copy");
+                    gop.key_ptr.* = try alloc.dupe(u8, "selection");
                     gop.value_ptr.* = .{};
                 }
                 break :table gop.value_ptr;
@@ -7251,10 +7251,9 @@ pub const Keybinds = struct {
             // unanchored selection, so motions move it around rather than
             // selecting anything until the anchor is dropped.
             try putDefault(&self.set, alloc, if (comptime builtin.target.os.tag.isDarwin())
-                "super+shift+space=activate_key_table:copy"
+                "super+shift+space=enter_selection_mode"
             else
-                "ctrl+shift+space=activate_key_table:copy");
-            try putDefault(&self.set, alloc, "chain=start_selection");
+                "ctrl+shift+space=enter_selection_mode");
 
             // Motions. These move the caret while unanchored and grow the
             // selection once anchored.
@@ -7267,19 +7266,23 @@ pub const Keybinds = struct {
             try putDefault(table, alloc, "home=adjust_selection:beginning_of_line");
             try putDefault(table, alloc, "end=adjust_selection:end_of_line");
 
-            // Shifted motions anchor first so that they extend the
-            // selection, matching what they do outside of the table.
-            try putDefault(table, alloc, "shift+arrow_left=selection_anchor:set");
-            try putDefault(table, alloc, "chain=adjust_selection:left");
-            try putDefault(table, alloc, "shift+arrow_right=selection_anchor:set");
-            try putDefault(table, alloc, "chain=adjust_selection:right");
-            try putDefault(table, alloc, "shift+arrow_up=selection_anchor:set");
-            try putDefault(table, alloc, "chain=adjust_selection:up");
-            try putDefault(table, alloc, "shift+arrow_down=selection_anchor:set");
-            try putDefault(table, alloc, "chain=adjust_selection:down");
+            // Shifted motions move the caret as well. They must not anchor
+            // implicitly: entering the mode is not supposed to select
+            // anything until the anchor is dropped deliberately, and an
+            // implicit anchor turns the first motion into a screenful of
+            // selected text.
+            try putDefault(table, alloc, "shift+arrow_left=adjust_selection:left");
+            try putDefault(table, alloc, "shift+arrow_right=adjust_selection:right");
+            try putDefault(table, alloc, "shift+arrow_up=adjust_selection:up");
+            try putDefault(table, alloc, "shift+arrow_down=adjust_selection:down");
 
-            // Drop or lift the anchor.
+            // Drop or lift the anchor. This is what begins selecting, and
+            // until it is pressed the motions above only move the caret.
             try putDefault(table, alloc, "v=selection_anchor:toggle");
+            try putDefault(table, alloc, if (comptime builtin.target.os.tag.isDarwin())
+                "super+shift+v=selection_anchor:toggle"
+            else
+                "ctrl+shift+v=selection_anchor:toggle");
 
             // Copy and leave.
             try putDefault(table, alloc, if (comptime builtin.target.os.tag.isDarwin())
@@ -7814,7 +7817,7 @@ pub const Keybinds = struct {
         try testing.expectEqual(0, keybinds.tables.count());
     }
 
-    test "default keybinds define the copy key table" {
+    test "default keybinds define the selection key table" {
         const testing = std.testing;
         const Action = inputpkg.Binding.Action;
         var arena = ArenaAllocator.init(testing.allocator);
@@ -7824,8 +7827,8 @@ pub const Keybinds = struct {
         var keybinds: Keybinds = .{};
         try keybinds.init(alloc);
 
-        const table = keybinds.tables.get("copy") orelse
-            return error.TestExpectedCopyTable;
+        const table = keybinds.tables.get("selection") orelse
+            return error.TestExpectedSelectionTable;
 
         // A plain motion is a single action, so the caret moves.
         {
@@ -7838,21 +7841,27 @@ pub const Keybinds = struct {
             );
         }
 
-        // A shifted motion anchors first and then moves, so it extends.
+        // A shifted motion also only moves. Nothing may anchor implicitly,
+        // or the first motion selects everything back to the entry point.
         {
             const entry = table.get(.{
                 .key = .{ .physical = .arrow_left },
                 .mods = .{ .shift = true },
             }) orelse return error.TestExpectedBinding;
-            const actions = entry.value_ptr.leaf_chained.actions.items;
-            try testing.expectEqual(2, actions.len);
-            try testing.expectEqual(
-                Action{ .selection_anchor = .set },
-                actions[0],
-            );
             try testing.expectEqual(
                 Action{ .adjust_selection = .left },
-                actions[1],
+                entry.value_ptr.leaf.action,
+            );
+        }
+
+        // Anchoring is only ever explicit.
+        {
+            const entry = table.get(.{
+                .key = .{ .unicode = 'v' },
+            }) orelse return error.TestExpectedBinding;
+            try testing.expectEqual(
+                Action{ .selection_anchor = .toggle },
+                entry.value_ptr.leaf.action,
             );
         }
 
@@ -7874,7 +7883,8 @@ pub const Keybinds = struct {
             try testing.expectEqual(Action.ignore, entry.value_ptr.leaf.action);
         }
 
-        // Entering the table also drops the caret.
+        // A single key enters the mode, which is also what the command
+        // palette runs.
         {
             const trigger: inputpkg.Binding.Trigger = .{
                 .key = .{ .physical = .space },
@@ -7885,13 +7895,26 @@ pub const Keybinds = struct {
             };
             const entry = keybinds.set.get(trigger) orelse
                 return error.TestExpectedBinding;
-            const actions = entry.value_ptr.leaf_chained.actions.items;
-            try testing.expectEqual(2, actions.len);
-            try testing.expectEqualStrings(
-                "copy",
-                actions[0].activate_key_table,
+            try testing.expectEqual(
+                Action.enter_selection_mode,
+                entry.value_ptr.leaf.action,
             );
-            try testing.expectEqual(Action.start_selection, actions[1]);
+        }
+
+        // Adding the table must not displace neighboring defaults. The
+        // semantic prompt binds are on the same modifiers as the mode.
+        {
+            const entry = keybinds.set.get(.{
+                .key = .{ .physical = .arrow_up },
+                .mods = if (comptime builtin.target.os.tag.isDarwin())
+                    .{ .super = true, .shift = true }
+                else
+                    .{ .ctrl = true, .shift = true },
+            }) orelse return error.TestExpectedBinding;
+            try testing.expectEqual(
+                Action{ .jump_to_prompt = -1 },
+                entry.value_ptr.leaf.action,
+            );
         }
     }
 
@@ -8151,10 +8174,10 @@ pub const Keybinds = struct {
         try keybinds.parseCLI(alloc, "");
 
         // User tables should be gone and the root set restored. The
-        // defaults define the built-in copy table, so that one remains.
+        // defaults define the built-in selection table, so that one remains.
         try testing.expect(!keybinds.tables.contains("foo"));
         try testing.expect(!keybinds.tables.contains("bar"));
-        try testing.expect(keybinds.tables.contains("copy"));
+        try testing.expect(keybinds.tables.contains("selection"));
         try testing.expect(keybinds.set.bindings.count() > 0);
     }
 };

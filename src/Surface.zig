@@ -2735,6 +2735,18 @@ pub fn preeditCallback(self: *Surface, preedit_: ?[]const u8) !void {
 /// is performable, only if the key event would trigger a binding.
 /// If a performable binding is found and the event is not performable,
 /// then Ghosty will act as though the binding does not exist.
+/// Whether a binding entry declines to handle the key, meaning lookup should
+/// continue outward to the next active key table and finally the default set.
+fn isFallthrough(entry: input.Binding.Set.Entry) bool {
+    return switch (entry.value_ptr.*) {
+        .leaf => |leaf| leaf.action == .fallthrough,
+
+        // A leader can't be an action, and a chain that starts by declining
+        // the key would have nowhere to run its remaining actions.
+        .leader, .leaf_chained => false,
+    };
+}
+
 pub fn keyEventIsBinding(
     self: *Surface,
     event_orig: input.KeyEvent,
@@ -2762,12 +2774,18 @@ pub fn keyEventIsBinding(
         for (0..table_items.len) |i| {
             const rev_i: usize = table_items.len - 1 - i;
             if (table_items[rev_i].set.getEvent(event)) |entry| {
+                // Declined by this table, keep looking outward. This must
+                // match maybeHandleBinding or the apprt is told about a
+                // binding that will not run.
+                if (isFallthrough(entry)) continue;
                 break :entry entry;
             }
         }
 
         // Check the root set
-        break :entry self.config.keybind.set.getEvent(event) orelse return null;
+        const root = self.config.keybind.set.getEvent(event) orelse return null;
+        if (isFallthrough(root)) return null;
+        break :entry root;
     };
 
     // Return flags based on the
@@ -3035,6 +3053,12 @@ fn maybeHandleBinding(
                 const rev_i: usize = table_items.len - 1 - i;
                 const table = table_items[rev_i];
                 if (table.set.getEvent(event)) |v| {
+                    // A fallthrough binding means this table declines the
+                    // key, so keep searching outward as if it were unbound
+                    // here. Checked before the one-shot handling below so
+                    // that declining doesn't consume a one-shot table.
+                    if (isFallthrough(v)) continue;
+
                     // If this is a one-shot activation AND its the currently
                     // active table, then we deactivate it after this.
                     // Note: we may want to change the semantics here to
@@ -3049,9 +3073,12 @@ fn maybeHandleBinding(
             }
         }
 
-        // No table, use our default set
-        break :entry self.config.keybind.set.getEvent(event) orelse
+        // No table, use our default set. There is nothing further to fall
+        // through to here, so a fallthrough binding is just unbound.
+        const root = self.config.keybind.set.getEvent(event) orelse
             return null;
+        if (isFallthrough(root)) return null;
+        break :entry root;
     };
 
     // Determine if this entry has an action or if its a leader key.
@@ -5621,6 +5648,11 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 try self.queueRender();
             }
         },
+
+        // Resolved during binding lookup, so this is only reachable when
+        // invoked directly, e.g. from the command palette or libghostty.
+        // There is no table to decline on behalf of, so it does nothing.
+        .fallthrough => return false,
 
         .start_selection => try self.startSelection(),
 

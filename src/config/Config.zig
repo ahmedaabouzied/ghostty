@@ -7377,6 +7377,20 @@ pub const Keybinds = struct {
             // would be encoded and sent to the shell, which is how you end
             // up running a command you never typed.
             try putDefault(table, alloc, "catch_all=ignore");
+
+            // `catch_all` is matched a second time with the modifiers
+            // stripped, so the line above would also swallow application
+            // shortcuts such as quitting or opening a tab. Decline those
+            // combinations instead so they resolve against the default set,
+            // which leaves only unmodified keys swallowed.
+            if (comptime builtin.target.os.tag.isDarwin()) {
+                try putDefault(table, alloc, "super+catch_all=fallthrough");
+                try putDefault(table, alloc, "super+shift+catch_all=fallthrough");
+                try putDefault(table, alloc, "super+alt+catch_all=fallthrough");
+                try putDefault(table, alloc, "super+ctrl+catch_all=fallthrough");
+            } else {
+                try putDefault(table, alloc, "ctrl+shift+catch_all=fallthrough");
+            }
         }
     }
 
@@ -7955,6 +7969,38 @@ pub const Keybinds = struct {
             const entry = table.get(.{ .key = .catch_all }) orelse
                 return error.TestExpectedBinding;
             try testing.expectEqual(Action.ignore, entry.value_ptr.leaf.action);
+        }
+
+        // Application shortcuts still resolve against the default set, so
+        // things like quitting keep working while the mode is active.
+        {
+            const entry = table.get(.{
+                .key = .catch_all,
+                .mods = if (comptime builtin.target.os.tag.isDarwin())
+                    .{ .super = true, .shift = true }
+                else
+                    .{ .ctrl = true, .shift = true },
+            }) orelse return error.TestExpectedBinding;
+            try testing.expectEqual(
+                Action.fallthrough,
+                entry.value_ptr.leaf.action,
+            );
+        }
+
+        // An explicit binding still beats the declining catch_all above,
+        // since exact triggers are matched before catch_all.
+        {
+            const entry = table.get(.{
+                .key = .{ .unicode = 'v' },
+                .mods = if (comptime builtin.target.os.tag.isDarwin())
+                    .{ .super = true, .shift = true }
+                else
+                    .{ .ctrl = true, .shift = true },
+            }) orelse return error.TestExpectedBinding;
+            try testing.expectEqual(
+                Action{ .selection_anchor = .toggle },
+                entry.value_ptr.leaf.action,
+            );
         }
 
         // A single key enters the mode, which is also what the command

@@ -250,6 +250,18 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = i18n.N_("Select all text on the screen."),
         }},
 
+        .start_selection => comptime &.{.{
+            .action = .start_selection,
+            .title = "Start Selection",
+            .description = "Start a new selection at the cursor.",
+        }},
+
+        .clear_selection => comptime &.{.{
+            .action = .clear_selection,
+            .title = "Clear Selection",
+            .description = "Clear the current selection.",
+        }},
+
         .scroll_to_top => comptime &.{.{
             .action = .scroll_to_top,
             .title = i18n.N_("Scroll to Top"),

@@ -54,6 +54,12 @@ pub const min_window_height_cells: u32 = 4;
 /// given time. `activate_key_table` calls after this are ignored.
 const max_active_key_tables = 8;
 
+/// The key table that `enter_selection_mode` activates. This must match the
+/// table defined by the default keybinds in Config.zig. A user who removes
+/// that table also removes the mode, which `enter_selection_mode` reports by
+/// doing nothing.
+const selection_key_table = "selection";
+
 /// Unique ID used to identify this surface for IPC purposes. It is
 /// exposed to the commands running in surfaces as the environment variable
 /// GHOSTTY_SURFACE_ID. It must not be zero as zero is used to incicate a null
@@ -2397,6 +2403,90 @@ fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
             log.warn("apprt failed selection_changed notification err={}", .{err});
         };
     }
+}
+
+/// Start a keyboard-driven selection at the cursor.
+///
+/// The selection covers a single cell and is left unanchored, so it reads
+/// and behaves as a caret that motions move around rather than as selected
+/// text. See `selection_anchored`.
+fn startSelection(self: *Surface) !void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+
+    // Anchor at the cursor, but only if the cursor is something the user
+    // can actually see. If they've scrolled back into history then the
+    // cursor is irrelevant to them and we start at the top of what they're
+    // looking at instead.
+    const pin = pin: {
+        const cursor = screen.cursor.page_pin.*;
+        const tl = screen.pages.getTopLeft(.viewport);
+        const br = screen.pages.getBottomRight(.viewport) orelse
+            break :pin cursor;
+        break :pin if (cursor.isBetween(tl, br)) cursor else tl;
+    };
+
+    try self.setSelection(terminal.Selection.init(pin, pin, false));
+
+    // Start as a caret rather than a selection: motions move it around
+    // until something drops the anchor.
+    self.selection_anchored = false;
+
+    try self.queueRender();
+}
+
+/// Push a named key table onto the active stack.
+///
+/// Returns false if the table could not be activated: it doesn't exist, it
+/// is already the innermost table, or the stack is at `max_active_key_tables`.
+fn activateKeyTable(self: *Surface, name: []const u8, once: bool) !bool {
+    // Look up the table in our config
+    const set = self.config.keybind.tables.getPtr(name) orelse {
+        log.debug("key table not found: {s}", .{name});
+        return false;
+    };
+
+    // If this is the same table as is currently active, then do nothing.
+    if (self.keyboard.table_stack.items.len > 0) {
+        const items = self.keyboard.table_stack.items;
+        const active = items[items.len - 1].set;
+        if (active == set) {
+            log.debug("ignoring duplicate activate table: {s}", .{name});
+            return false;
+        }
+    }
+
+    // If we're already at the max, ignore it.
+    if (self.keyboard.table_stack.items.len >= max_active_key_tables) {
+        log.info(
+            "ignoring activate table, max depth reached: {s}",
+            .{name},
+        );
+        return false;
+    }
+
+    // Add the table to the stack.
+    try self.keyboard.table_stack.append(self.alloc, .{
+        .set = set,
+        .once = once,
+    });
+
+    // Notify the UI.
+    _ = self.rt_app.performAction(
+        .{ .surface = self },
+        .key_table,
+        .{ .activate = name },
+    ) catch |err| {
+        log.warn(
+            "failed to notify app of key table err={}",
+            .{err},
+        );
+    };
+
+    log.debug("key table activated: {s}", .{name});
+    return true;
 }
 
 /// Set a selection and, per `copy_on_select`, copy it to the clipboard.
@@ -5532,31 +5622,17 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             }
         },
 
-        .start_selection => {
-            self.renderer_state.mutex.lock();
-            defer self.renderer_state.mutex.unlock();
+        .start_selection => try self.startSelection(),
 
-            const screen: *terminal.Screen = self.io.terminal.screens.active;
+        .enter_selection_mode => {
+            // The table is what makes the motions available, so if it is
+            // gone there is no mode to enter and we leave the selection
+            // alone rather than half-entering.
+            if (!try self.activateKeyTable(selection_key_table, false)) {
+                return false;
+            }
 
-            // Anchor at the cursor, but only if the cursor is something the
-            // user can actually see. If they've scrolled back into history
-            // then the cursor is irrelevant to them and we start at the top
-            // of what they're looking at instead.
-            const pin = pin: {
-                const cursor = screen.cursor.page_pin.*;
-                const tl = screen.pages.getTopLeft(.viewport);
-                const br = screen.pages.getBottomRight(.viewport) orelse
-                    break :pin cursor;
-                break :pin if (cursor.isBetween(tl, br)) cursor else tl;
-            };
-
-            try self.setSelection(terminal.Selection.init(pin, pin, false));
-
-            // Start as a caret rather than a selection: motions move it
-            // around until something drops the anchor.
-            self.selection_anchored = false;
-
-            try self.queueRender();
+            try self.startSelection();
         },
 
         .selection_anchor => |anchor| {
@@ -5618,53 +5694,10 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
         inline .activate_key_table,
         .activate_key_table_once,
-        => |name, tag| {
-            // Look up the table in our config
-            const set = self.config.keybind.tables.getPtr(name) orelse {
-                log.debug("key table not found: {s}", .{name});
-                return false;
-            };
-
-            // If this is the same table as is currently active, then
-            // do nothing.
-            if (self.keyboard.table_stack.items.len > 0) {
-                const items = self.keyboard.table_stack.items;
-                const active = items[items.len - 1].set;
-                if (active == set) {
-                    log.debug("ignoring duplicate activate table: {s}", .{name});
-                    return false;
-                }
-            }
-
-            // If we're already at the max, ignore it.
-            if (self.keyboard.table_stack.items.len >= max_active_key_tables) {
-                log.info(
-                    "ignoring activate table, max depth reached: {s}",
-                    .{name},
-                );
-                return false;
-            }
-
-            // Add the table to the stack.
-            try self.keyboard.table_stack.append(self.alloc, .{
-                .set = set,
-                .once = tag == .activate_key_table_once,
-            });
-
-            // Notify the UI.
-            _ = self.rt_app.performAction(
-                .{ .surface = self },
-                .key_table,
-                .{ .activate = name },
-            ) catch |err| {
-                log.warn(
-                    "failed to notify app of key table err={}",
-                    .{err},
-                );
-            };
-
-            log.debug("key table activated: {s}", .{name});
-        },
+        => |name, tag| return try self.activateKeyTable(
+            name,
+            tag == .activate_key_table_once,
+        ),
 
         .deactivate_key_table => {
             switch (self.keyboard.table_stack.items.len) {

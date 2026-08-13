@@ -438,6 +438,17 @@ pub const Action = union(enum) {
     /// Select all text on the screen.
     select_all,
 
+    /// Enter keyboard selection mode.
+    ///
+    /// This activates the `selection` key table and starts a selection at
+    /// the cursor, which is everything needed to begin selecting text with
+    /// the keyboard. It exists as a single action so that it can be bound
+    /// to one key and offered in the command palette; the equivalent chain
+    /// is `activate_key_table:selection` followed by `start_selection`.
+    ///
+    /// This does nothing if the `selection` key table has been removed.
+    enter_selection_mode,
+
     /// Start a new selection at the cursor.
     ///
     /// The new selection covers only the single cell under the cursor.
@@ -1462,6 +1473,7 @@ pub const Action = union(enum) {
             .set_window_title,
             .clear_screen,
             .select_all,
+            .enter_selection_mode,
             .start_selection,
             .selection_anchor,
             .clear_selection,

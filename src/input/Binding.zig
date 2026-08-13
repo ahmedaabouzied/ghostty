@@ -449,6 +449,36 @@ pub const Action = union(enum) {
     /// while browsing scrollback begins where you are looking.
     start_selection,
 
+    /// Anchor or unanchor the current selection.
+    ///
+    /// An anchored selection grows when `adjust_selection` moves it, which
+    /// is the normal behavior. An unanchored selection collapses onto its
+    /// moving end instead, so it acts as a caret you can move around the
+    /// screen without selecting anything.
+    ///
+    /// Together with `start_selection` this is what makes a keyboard-driven
+    /// selection possible: start a selection, move the caret to where the
+    /// text begins, anchor it, then move to where the text ends.
+    ///
+    /// This does nothing when there is no selection.
+    ///
+    /// Valid arguments are:
+    ///
+    ///   - `set`
+    ///
+    ///     Anchor the selection so that motions grow it.
+    ///
+    ///   - `clear`
+    ///
+    ///     Unanchor the selection so that motions move it as a caret. The
+    ///     selection collapses onto its moving end.
+    ///
+    ///   - `toggle`
+    ///
+    ///     Toggle between the two states above.
+    ///
+    selection_anchor: SelectionAnchor,
+
     /// Clear the current selection, if any.
     ///
     /// This does nothing when there is no selection, so combining it with
@@ -1035,6 +1065,12 @@ pub const Action = union(enum) {
         next,
     };
 
+    pub const SelectionAnchor = enum {
+        set,
+        clear,
+        toggle,
+    };
+
     pub const AdjustSelection = enum {
         left,
         right,
@@ -1393,6 +1429,7 @@ pub const Action = union(enum) {
             .clear_screen,
             .select_all,
             .start_selection,
+            .selection_anchor,
             .clear_selection,
             .scroll_to_top,
             .scroll_to_bottom,

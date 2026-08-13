@@ -177,6 +177,20 @@ command_timer: ?std.Io.Timestamp = null,
 /// Search state
 search: ?Search = null,
 
+/// Whether the current selection is anchored.
+///
+/// An anchored selection grows when `adjust_selection` moves its end. That
+/// is what mouse drags and the `shift+arrow` binds do. An unanchored
+/// selection instead collapses onto its end after every adjustment, so it
+/// behaves like a caret that can be moved freely around the screen. This is
+/// what `start_selection` sets up, and it is what makes a keyboard-driven
+/// selection possible without immediately selecting text.
+///
+/// This is meaningless when there is no selection. `setSelection` resets it
+/// to true so that every other way of making a selection (mouse, select_all,
+/// search) keeps the historical grow-on-adjust behavior.
+selection_anchored: bool = true,
+
 /// Used to rate limit BEL handling.
 last_bell_time: ?std.Io.Timestamp = null,
 
@@ -2369,6 +2383,10 @@ fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
     };
 
     try self.io.terminal.screens.active.select(sel_);
+
+    // Any selection made through this path is a normal, anchored one.
+    // `start_selection` opts back out immediately after calling us.
+    self.selection_anchored = true;
 
     if (changed) {
         _ = self.rt_app.performAction(
@@ -5533,6 +5551,37 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             };
 
             try self.setSelection(terminal.Selection.init(pin, pin, false));
+
+            // Start as a caret rather than a selection: motions move it
+            // around until something drops the anchor.
+            self.selection_anchored = false;
+
+            try self.queueRender();
+        },
+
+        .selection_anchor => |anchor| {
+            self.renderer_state.mutex.lock();
+            defer self.renderer_state.mutex.unlock();
+
+            const screen: *terminal.Screen = self.io.terminal.screens.active;
+            const sel = if (screen.selection) |*sel| sel else return false;
+
+            const anchored: bool = switch (anchor) {
+                .set => true,
+                .clear => false,
+                .toggle => !self.selection_anchored,
+            };
+
+            // Nothing to do, so let the keybind fall through when the
+            // `performable` flag is set.
+            if (anchored == self.selection_anchored) return false;
+            self.selection_anchored = anchored;
+
+            // Releasing the anchor leaves the caret wherever the moving end
+            // already is, so collapse onto it.
+            if (!anchored) sel.startPtr().* = sel.end();
+
+            screen.dirty.selection = true;
             try self.queueRender();
         },
 
@@ -5693,6 +5742,10 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 .beginning_of_line => .beginning_of_line,
                 .end_of_line => .end_of_line,
             });
+
+            // An unanchored selection is a caret: it moves rather than
+            // grows, so drag the start along with the end.
+            if (!self.selection_anchored) sel.startPtr().* = sel.end();
 
             // If the selection endpoint is outside of the current viewpoint,
             // scroll it in to view. Note we always specifically use sel.end

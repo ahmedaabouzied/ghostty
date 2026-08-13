@@ -6436,6 +6436,27 @@ pub const Keybinds = struct {
         table: []const u8,
     } = .root,
 
+    /// Add a binding to a set from one of our own built-in keybind strings.
+    ///
+    /// This exists so that defaults can use the parsed string form, which is
+    /// the only way to express chained actions. The input is always a
+    /// literal from this file, so a parse failure is a bug in Ghostty rather
+    /// than something a user can trigger, and we report it as such to keep
+    /// the error set down to allocation failure.
+    fn putDefault(
+        set: *inputpkg.Binding.Set,
+        alloc: Allocator,
+        value: []const u8,
+    ) Allocator.Error!void {
+        set.parseAndPut(alloc, value) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => std.debug.panic(
+                "invalid built-in keybind '{s}': {}",
+                .{ value, err },
+            ),
+        };
+    }
+
     pub fn init(self: *Keybinds, alloc: Allocator) !void {
         // We don't clear the memory because it's in the arena and unlikely
         // to be free-able anyways (since arenas can only clear the last
@@ -7205,6 +7226,81 @@ pub const Keybinds = struct {
                 .{ .esc = "f" },
             );
         }
+
+        // Keyboard selection, i.e. "copy mode". This is a key table so that
+        // the motions can be unmodified keys without those keys reaching
+        // the terminal. See the key table documentation on `keybind`.
+        //
+        // These are written as parsed strings rather than `set.put` calls
+        // because chained actions are only expressible that way. We go
+        // through `Set.parseAndPut` rather than our own `parseCLI` because
+        // `parseCLI` calls us back for its reset path, and the resulting
+        // recursion makes the error sets unresolvable.
+        {
+            const table = table: {
+                const gop = try self.tables.getOrPut(alloc, "copy");
+                if (!gop.found_existing) {
+                    // Table names are expected to live in the arena.
+                    gop.key_ptr.* = try alloc.dupe(u8, "copy");
+                    gop.value_ptr.* = .{};
+                }
+                break :table gop.value_ptr;
+            };
+
+            // Entering drops a caret at the cursor. The caret is an
+            // unanchored selection, so motions move it around rather than
+            // selecting anything until the anchor is dropped.
+            try putDefault(&self.set, alloc, if (comptime builtin.target.os.tag.isDarwin())
+                "super+shift+space=activate_key_table:copy"
+            else
+                "ctrl+shift+space=activate_key_table:copy");
+            try putDefault(&self.set, alloc, "chain=start_selection");
+
+            // Motions. These move the caret while unanchored and grow the
+            // selection once anchored.
+            try putDefault(table, alloc, "arrow_left=adjust_selection:left");
+            try putDefault(table, alloc, "arrow_right=adjust_selection:right");
+            try putDefault(table, alloc, "arrow_up=adjust_selection:up");
+            try putDefault(table, alloc, "arrow_down=adjust_selection:down");
+            try putDefault(table, alloc, "page_up=adjust_selection:page_up");
+            try putDefault(table, alloc, "page_down=adjust_selection:page_down");
+            try putDefault(table, alloc, "home=adjust_selection:beginning_of_line");
+            try putDefault(table, alloc, "end=adjust_selection:end_of_line");
+
+            // Shifted motions anchor first so that they extend the
+            // selection, matching what they do outside of the table.
+            try putDefault(table, alloc, "shift+arrow_left=selection_anchor:set");
+            try putDefault(table, alloc, "chain=adjust_selection:left");
+            try putDefault(table, alloc, "shift+arrow_right=selection_anchor:set");
+            try putDefault(table, alloc, "chain=adjust_selection:right");
+            try putDefault(table, alloc, "shift+arrow_up=selection_anchor:set");
+            try putDefault(table, alloc, "chain=adjust_selection:up");
+            try putDefault(table, alloc, "shift+arrow_down=selection_anchor:set");
+            try putDefault(table, alloc, "chain=adjust_selection:down");
+
+            // Drop or lift the anchor.
+            try putDefault(table, alloc, "v=selection_anchor:toggle");
+
+            // Copy and leave.
+            try putDefault(table, alloc, if (comptime builtin.target.os.tag.isDarwin())
+                "super+c=copy_to_clipboard"
+            else
+                "ctrl+shift+c=copy_to_clipboard");
+            try putDefault(table, alloc, "chain=clear_selection");
+            try putDefault(table, alloc, "chain=deactivate_key_table");
+            try putDefault(table, alloc, "y=copy_to_clipboard");
+            try putDefault(table, alloc, "chain=clear_selection");
+            try putDefault(table, alloc, "chain=deactivate_key_table");
+
+            // Leave without copying.
+            try putDefault(table, alloc, "escape=deactivate_key_table");
+            try putDefault(table, alloc, "chain=clear_selection");
+
+            // Everything else is swallowed. Without this a stray keystroke
+            // would be encoded and sent to the shell, which is how you end
+            // up running a command you never typed.
+            try putDefault(table, alloc, "catch_all=ignore");
+        }
     }
 
     pub fn parseCLI(self: *Keybinds, alloc: Allocator, input: ?[]const u8) !void {
@@ -7718,6 +7814,87 @@ pub const Keybinds = struct {
         try testing.expectEqual(0, keybinds.tables.count());
     }
 
+    test "default keybinds define the copy key table" {
+        const testing = std.testing;
+        const Action = inputpkg.Binding.Action;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var keybinds: Keybinds = .{};
+        try keybinds.init(alloc);
+
+        const table = keybinds.tables.get("copy") orelse
+            return error.TestExpectedCopyTable;
+
+        // A plain motion is a single action, so the caret moves.
+        {
+            const entry = table.get(.{
+                .key = .{ .physical = .arrow_left },
+            }) orelse return error.TestExpectedBinding;
+            try testing.expectEqual(
+                Action{ .adjust_selection = .left },
+                entry.value_ptr.leaf.action,
+            );
+        }
+
+        // A shifted motion anchors first and then moves, so it extends.
+        {
+            const entry = table.get(.{
+                .key = .{ .physical = .arrow_left },
+                .mods = .{ .shift = true },
+            }) orelse return error.TestExpectedBinding;
+            const actions = entry.value_ptr.leaf_chained.actions.items;
+            try testing.expectEqual(2, actions.len);
+            try testing.expectEqual(
+                Action{ .selection_anchor = .set },
+                actions[0],
+            );
+            try testing.expectEqual(
+                Action{ .adjust_selection = .left },
+                actions[1],
+            );
+        }
+
+        // Escape leaves without copying.
+        {
+            const entry = table.get(.{
+                .key = .{ .physical = .escape },
+            }) orelse return error.TestExpectedBinding;
+            const actions = entry.value_ptr.leaf_chained.actions.items;
+            try testing.expectEqual(2, actions.len);
+            try testing.expectEqual(Action.deactivate_key_table, actions[0]);
+            try testing.expectEqual(Action.clear_selection, actions[1]);
+        }
+
+        // Unbound keys must not reach the terminal.
+        {
+            const entry = table.get(.{ .key = .catch_all }) orelse
+                return error.TestExpectedBinding;
+            try testing.expectEqual(Action.ignore, entry.value_ptr.leaf.action);
+        }
+
+        // Entering the table also drops the caret.
+        {
+            const trigger: inputpkg.Binding.Trigger = .{
+                .key = .{ .physical = .space },
+                .mods = if (comptime builtin.target.os.tag.isDarwin())
+                    .{ .super = true, .shift = true }
+                else
+                    .{ .ctrl = true, .shift = true },
+            };
+            const entry = keybinds.set.get(trigger) orelse
+                return error.TestExpectedBinding;
+            const actions = entry.value_ptr.leaf_chained.actions.items;
+            try testing.expectEqual(2, actions.len);
+            try testing.expectEqualStrings(
+                "copy",
+                actions[0].activate_key_table,
+            );
+            try testing.expectEqual(Action.start_selection, actions[1]);
+        }
+    }
+
     test "parseCLI table with slash in binding" {
         const testing = std.testing;
         var arena = ArenaAllocator.init(testing.allocator);
@@ -7973,8 +8150,11 @@ pub const Keybinds = struct {
         // Reset to defaults (empty value)
         try keybinds.parseCLI(alloc, "");
 
-        // Tables should be cleared, root set has defaults
-        try testing.expectEqual(0, keybinds.tables.count());
+        // User tables should be gone and the root set restored. The
+        // defaults define the built-in copy table, so that one remains.
+        try testing.expect(!keybinds.tables.contains("foo"));
+        try testing.expect(!keybinds.tables.contains("bar"));
+        try testing.expect(keybinds.tables.contains("copy"));
         try testing.expect(keybinds.set.bindings.count() > 0);
     }
 };

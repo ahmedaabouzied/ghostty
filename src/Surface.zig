@@ -5452,6 +5452,40 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             }
         },
 
+        .start_selection => {
+            self.renderer_state.mutex.lock();
+            defer self.renderer_state.mutex.unlock();
+
+            const screen: *terminal.Screen = self.io.terminal.screens.active;
+
+            // Anchor at the cursor, but only if the cursor is something the
+            // user can actually see. If they've scrolled back into history
+            // then the cursor is irrelevant to them and we start at the top
+            // of what they're looking at instead.
+            const pin = pin: {
+                const cursor = screen.cursor.page_pin.*;
+                const tl = screen.pages.getTopLeft(.viewport);
+                const br = screen.pages.getBottomRight(.viewport) orelse
+                    break :pin cursor;
+                break :pin if (cursor.isBetween(tl, br)) cursor else tl;
+            };
+
+            try self.setSelection(terminal.Selection.init(pin, pin, false));
+            try self.queueRender();
+        },
+
+        .clear_selection => {
+            self.renderer_state.mutex.lock();
+            defer self.renderer_state.mutex.unlock();
+
+            // If there is no selection then we do nothing, allowing the
+            // keybind to fall through to the terminal when `performable`.
+            if (self.io.terminal.screens.active.selection == null) return false;
+
+            try self.setSelection(null);
+            try self.queueRender();
+        },
+
         .inspector => |mode| return try self.rt_app.performAction(
             .{ .surface = self },
             .inspector,

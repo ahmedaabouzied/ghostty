@@ -438,6 +438,24 @@ pub const Action = union(enum) {
     /// Select all text on the screen.
     select_all,
 
+    /// Start a new selection at the cursor.
+    ///
+    /// The new selection covers only the single cell under the cursor.
+    /// `adjust_selection` can then be used to grow it. Any existing
+    /// selection is replaced.
+    ///
+    /// If the cursor is scrolled out of view then the selection starts at
+    /// the top-left of the viewport instead, so that a selection started
+    /// while browsing scrollback begins where you are looking.
+    start_selection,
+
+    /// Clear the current selection, if any.
+    ///
+    /// This does nothing when there is no selection, so combining it with
+    /// the `performable:` flag will let the keybind fall through to the
+    /// terminal whenever nothing is selected.
+    clear_selection,
+
     /// Scroll to the top of the screen.
     scroll_to_top,
 
@@ -1374,6 +1392,8 @@ pub const Action = union(enum) {
             .set_tab_title,
             .clear_screen,
             .select_all,
+            .start_selection,
+            .clear_selection,
             .scroll_to_top,
             .scroll_to_bottom,
             .scroll_to_selection,

@@ -2411,8 +2411,8 @@ fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
 /// and behaves as a caret that motions move around rather than as selected
 /// text. See `selection_anchored`.
 fn startSelection(self: *Surface) !void {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
 
     const screen: *terminal.Screen = self.io.terminal.screens.active;
 
@@ -5668,8 +5668,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         },
 
         .selection_anchor => |anchor| {
-            self.renderer_state.mutex.lock();
-            defer self.renderer_state.mutex.unlock();
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
 
             const screen: *terminal.Screen = self.io.terminal.screens.active;
             const sel = if (screen.selection) |*sel| sel else return false;
@@ -5694,8 +5694,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         },
 
         .clear_selection => {
-            self.renderer_state.mutex.lock();
-            defer self.renderer_state.mutex.unlock();
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
 
             // If there is no selection then we do nothing, allowing the
             // keybind to fall through to the terminal when `performable`.

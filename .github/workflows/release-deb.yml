@@ -1,10 +1,10 @@
 name: Ubuntu Package
 
-# Builds an installable .deb of Ghostty for Ubuntu 24.04 (and newer) and
-# publishes it as a release asset.
+# Builds installable .deb packages of Ghostty for Ubuntu 24.04 (and newer) on
+# amd64 and arm64, and publishes them as release assets.
 #
 # Push a tag like "deb-v1.3.2" to cut a release, or run this workflow manually
-# to get the package as a build artifact without publishing anything. The tag
+# to get the packages as build artifacts without publishing anything. The tag
 # prefix deliberately avoids the "vX.Y.Z" pattern used by the upstream
 # release-tag workflow, which needs runners this fork does not have.
 
@@ -26,15 +26,28 @@ permissions:
 env:
   # Must match `minimum_zig_version` in build.zig.zon.
   ZIG_VERSION: 0.16.0
-  ZIG_SHA256: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
   # Ubuntu 24.04 ships 0.12.0; Ghostty needs 0.16.0 or newer (see HACKING.md).
   BLUEPRINT_COMPILER_VERSION: v0.16.0
 
 jobs:
   build:
-    name: Build .deb (amd64)
-    runs-on: ubuntu-24.04
+    name: Build .deb (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
+
+    strategy:
+      # Publish whichever architecture succeeds rather than losing both.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            zig_arch: x86_64
+            zig_sha256: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            zig_arch: aarch64
+            zig_sha256: ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17
 
     steps:
       - name: Checkout code
@@ -85,8 +98,11 @@ jobs:
           blueprint-compiler --version
 
       - name: Install Zig ${{ env.ZIG_VERSION }}
+        env:
+          ZIG_ARCH: ${{ matrix.zig_arch }}
+          ZIG_SHA256: ${{ matrix.zig_sha256 }}
         run: |
-          url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz"
           curl --fail --silent --show-error --location --output /tmp/zig.tar.xz "$url"
           echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum --check --strict -
           sudo mkdir -p /opt/zig
@@ -96,17 +112,18 @@ jobs:
 
       # Restore and save are separate so the cache is still written when the
       # build fails. Zig's cache is content addressed, so a restore from an
-      # earlier commit still hits for every module that did not change.
+      # earlier commit still hits for every module that did not change. The
+      # compiled output is architecture specific, so the key carries the arch.
       - name: Restore build cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             .zig-deb-cache
             .zig-cache
-          key: zig-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig.zon.txt') }}-${{ github.sha }}
+          key: zig-${{ matrix.arch }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig.zon.txt') }}-${{ github.sha }}
           restore-keys: |
-            zig-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig.zon.txt') }}-
-            zig-${{ env.ZIG_VERSION }}-
+            zig-${{ matrix.arch }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig.zon.txt') }}-
+            zig-${{ matrix.arch }}-${{ env.ZIG_VERSION }}-
 
       - name: Determine version
         id: version
@@ -136,7 +153,7 @@ jobs:
           path: |
             .zig-deb-cache
             .zig-cache
-          key: zig-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig.zon.txt') }}-${{ github.sha }}
+          key: zig-${{ matrix.arch }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig.zon.txt') }}-${{ github.sha }}
 
       - name: Inspect package
         run: |
@@ -155,24 +172,45 @@ jobs:
           infocmp -x xterm-ghostty >/dev/null
 
       - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ghostty-deb-amd64
+          name: ghostty-deb-${{ matrix.arch }}
           path: zig-out/deb/*.deb
           if-no-files-found: error
 
+  # A single publishing job, so the two architectures cannot race each other
+  # to create the same release.
+  release:
+    name: Publish release
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: ghostty-deb-*
+          merge-multiple: true
+          path: packages
+
       - name: Publish release
-        if: github.event_name == 'push'
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
-          name: Ghostty ${{ steps.version.outputs.version }} (Ubuntu)
-          files: zig-out/deb/*.deb
+          name: Ghostty ${{ github.ref_name }} (Ubuntu)
+          files: packages/*.deb
           fail_on_unmatched_files: true
           body: |
-            Ghostty ${{ steps.version.outputs.version }} for Ubuntu 24.04 and newer (amd64).
+            Ghostty for Ubuntu 24.04 and newer.
 
-            Download the `.deb` below and install it with:
+            Download the `.deb` matching your architecture (`dpkg --print-architecture`)
+            and install it with:
 
             ```
-            sudo apt install ./ghostty_*_amd64.deb
+            sudo apt install ./ghostty_*.deb
             ```
+
+            | Architecture | File |
+            | --- | --- |
+            | amd64 (Intel/AMD) | `ghostty_*_amd64.deb` |
+            | arm64 (aarch64) | `ghostty_*_arm64.deb` |

@@ -96,6 +96,15 @@ stage="$out_dir/root"
 rm -rf "$stage"
 mkdir -p "$stage" "$out_dir"
 
+# When freetype comes from the system, Ghostty links its bzip2 support as
+# "bzip2", the name Nix uses. Debian and Ubuntu call that library libbz2, so
+# hand the linker a script under a search prefix that redirects one name to
+# the other. This is the same workaround as the "bzip2-redirect" module in
+# flatpak/dependencies.yml, just scoped to this build instead of a runtime.
+shim="$ROOT/.zig-deb-shim"
+mkdir -p "$shim/lib"
+printf 'INPUT(libbz2.so)\n' >"$shim/lib/libbzip2.so"
+
 # --system puts the build in system package mode: dependencies link against
 # the distro's shared libraries, the binary is a PIE, man pages are built, and
 # the systemd user unit lands in /usr/lib instead of /usr/share.
@@ -107,6 +116,7 @@ echo "==> Running zig build"
 DESTDIR="$stage" zig build \
   --prefix /usr \
   --system "$system_deps" \
+  --search-prefix "$shim" \
   -Doptimize=ReleaseFast \
   -Dcpu=baseline \
   -Dversion-string="$version" \

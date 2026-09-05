@@ -109,9 +109,18 @@ printf 'INPUT(libbz2.so)\n' >"$shim/lib/libbzip2.so"
 # the distro's shared libraries, the binary is a PIE, man pages are built, and
 # the systemd user unit lands in /usr/lib instead of /usr/share.
 #
-# gtk4-layer-shell is the exception. Ubuntu 24.04 does not ship it, so we opt
-# out of system integration and let the build produce the shared library
-# itself; it installs alongside the binary and ships inside this package.
+# Two libraries opt out of that:
+#
+#   gtk4-layer-shell  Ubuntu 24.04 does not package it at all, so the build
+#                     produces the shared library itself and it ships inside
+#                     this package.
+#
+#   harfbuzz          Ghostty needs HB_BUFFER_CLUSTER_LEVEL_GRAPHEMES, added
+#                     in harfbuzz 11.0.0. Ubuntu 24.04 ships 8.3.0, so the
+#                     pinned harfbuzz is built from source and linked
+#                     statically. GTK keeps using the system copy; the two do
+#                     not share objects, and the static symbols stay private
+#                     to the executable.
 echo "==> Running zig build"
 DESTDIR="$stage" zig build \
   --prefix /usr \
@@ -120,7 +129,8 @@ DESTDIR="$stage" zig build \
   -Doptimize=ReleaseFast \
   -Dcpu=baseline \
   -Dversion-string="$version" \
-  -fno-sys=gtk4-layer-shell
+  -fno-sys=gtk4-layer-shell \
+  -fno-sys=harfbuzz
 
 if [ ! -x "$stage/usr/bin/ghostty" ]; then
   echo "build did not produce $stage/usr/bin/ghostty" >&2

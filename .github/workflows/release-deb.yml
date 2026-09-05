@@ -94,11 +94,19 @@ jobs:
             --directory /opt/zig --strip-components=1
           echo /opt/zig >>"$GITHUB_PATH"
 
-      - name: Cache Zig dependencies
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      # Restore and save are separate so the cache is still written when the
+      # build fails. Zig's cache is content addressed, so a restore from an
+      # earlier commit still hits for every module that did not change.
+      - name: Restore build cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: .zig-deb-cache
-          key: zig-deps-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig.zon.txt') }}
+          path: |
+            .zig-deb-cache
+            .zig-cache
+          key: zig-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig.zon.txt') }}-${{ github.sha }}
+          restore-keys: |
+            zig-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig.zon.txt') }}-
+            zig-${{ env.ZIG_VERSION }}-
 
       - name: Determine version
         id: version
@@ -120,6 +128,15 @@ jobs:
           else
             ./dist/deb/build-deb.sh
           fi
+
+      - name: Save build cache
+        if: always()
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            .zig-deb-cache
+            .zig-cache
+          key: zig-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig.zon.txt') }}-${{ github.sha }}
 
       - name: Inspect package
         run: |

@@ -74,6 +74,20 @@ mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
 echo "==> Fetching Zig dependencies into $ZIG_GLOBAL_CACHE_DIR"
 "$ROOT/nix/build-support/fetch-zig-cache.sh"
 
+# Zig 0.16 keeps fetched packages in the global cache as tarballs, but
+# --system wants them extracted into directories named for the package hash.
+# Each tarball already has exactly that directory at its root, so unpacking
+# them side by side produces the layout --system looks for.
+system_deps="$ROOT/.zig-deb-system"
+mkdir -p "$system_deps"
+
+echo "==> Extracting dependencies into $system_deps"
+for archive in "$ZIG_GLOBAL_CACHE_DIR"/p/*.tar.gz; do
+  [ -e "$archive" ] || continue
+  name="$(basename "$archive" .tar.gz)"
+  [ -d "$system_deps/$name" ] || tar -xzf "$archive" -C "$system_deps"
+done
+
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
@@ -92,7 +106,7 @@ mkdir -p "$stage" "$out_dir"
 echo "==> Running zig build"
 DESTDIR="$stage" zig build \
   --prefix /usr \
-  --system "$ZIG_GLOBAL_CACHE_DIR/p" \
+  --system "$system_deps" \
   -Doptimize=ReleaseFast \
   -Dcpu=baseline \
   -Dversion-string="$version" \

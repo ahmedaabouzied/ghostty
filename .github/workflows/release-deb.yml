@@ -1,0 +1,161 @@
+name: Ubuntu Package
+
+# Builds an installable .deb of Ghostty for Ubuntu 24.04 (and newer) and
+# publishes it as a release asset.
+#
+# Push a tag like "deb-v1.3.2" to cut a release, or run this workflow manually
+# to get the package as a build artifact without publishing anything. The tag
+# prefix deliberately avoids the "vX.Y.Z" pattern used by the upstream
+# release-tag workflow, which needs runners this fork does not have.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (semver, e.g. 1.3.2). Defaults to a dev version derived from build.zig.zon and the commit."
+        required: false
+        type: string
+
+  push:
+    tags:
+      - "deb-v*"
+
+permissions:
+  contents: write
+
+env:
+  # Must match `minimum_zig_version` in build.zig.zon.
+  ZIG_VERSION: 0.16.0
+  ZIG_SHA256: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+  # Ubuntu 24.04 ships 0.12.0; Ghostty needs 0.16.0 or newer (see HACKING.md).
+  BLUEPRINT_COMPILER_VERSION: v0.16.0
+
+jobs:
+  build:
+    name: Build .deb (amd64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # zig build derives version metadata from git history.
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            dpkg-dev \
+            gettext \
+            libadwaita-1-dev \
+            libbz2-dev \
+            libfontconfig-dev \
+            libfreetype-dev \
+            libglib2.0-dev \
+            libgtk-4-dev \
+            libharfbuzz-dev \
+            libncurses-dev \
+            libonig-dev \
+            libpng-dev \
+            libwayland-bin \
+            libwayland-dev \
+            libx11-dev \
+            libxml2-utils \
+            meson \
+            ncurses-bin \
+            ninja-build \
+            pandoc \
+            pkg-config \
+            python3 \
+            wayland-protocols \
+            zlib1g-dev
+
+      - name: Install blueprint-compiler
+        run: |
+          git clone --depth 1 --branch "$BLUEPRINT_COMPILER_VERSION" \
+            https://gitlab.gnome.org/GNOME/blueprint-compiler.git \
+            /tmp/blueprint-compiler
+          cd /tmp/blueprint-compiler
+          meson setup _build --prefix=/usr
+          sudo ninja -C _build install
+          blueprint-compiler --version
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: |
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          curl --fail --silent --show-error --location --output /tmp/zig.tar.xz "$url"
+          echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum --check --strict -
+          sudo mkdir -p /opt/zig
+          sudo tar --extract --xz --file /tmp/zig.tar.xz \
+            --directory /opt/zig --strip-components=1
+          echo /opt/zig >>"$GITHUB_PATH"
+
+      - name: Cache Zig dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .zig-deb-cache
+          key: zig-deps-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig.zon.txt') }}
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # refs/tags/deb-v1.3.2 -> 1.3.2
+            version="${GITHUB_REF_NAME#deb-v}"
+          else
+            version="${{ inputs.version }}"
+          fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
+      - name: Build package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if [ -n "$VERSION" ]; then
+            ./dist/deb/build-deb.sh --version "$VERSION"
+          else
+            ./dist/deb/build-deb.sh
+          fi
+
+      - name: Inspect package
+        run: |
+          deb="$(echo zig-out/deb/*.deb)"
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb"
+
+      # Installing on the runner proves the dependency list actually resolves
+      # against stock Ubuntu 24.04 and that the binary runs.
+      - name: Verify package installs
+        run: |
+          deb="$(echo zig-out/deb/*.deb)"
+          sudo apt-get install -y "$PWD/$deb"
+          ghostty --version
+          test -f /usr/share/applications/com.mitchellh.ghostty.desktop
+          infocmp -x xterm-ghostty >/dev/null
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6.0
+        with:
+          name: ghostty-deb-amd64
+          path: zig-out/deb/*.deb
+          if-no-files-found: error
+
+      - name: Publish release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          name: Ghostty ${{ steps.version.outputs.version }} (Ubuntu)
+          files: zig-out/deb/*.deb
+          fail_on_unmatched_files: true
+          body: |
+            Ghostty ${{ steps.version.outputs.version }} for Ubuntu 24.04 and newer (amd64).
+
+            Download the `.deb` below and install it with:
+
+            ```
+            sudo apt install ./ghostty_*_amd64.deb
+            ```
